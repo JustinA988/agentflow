@@ -14,6 +14,15 @@ It clones the repo to a temp dir, branches, runs the agent on the issue, runs th
 If tests fail, the PR opens as a **draft** with the failure log. Without `--test`, the test command is auto-detected
 (npm, cargo, go, pytest); if none is found the PR says tests were not run.
 
+## Web UI
+
+```bash
+agentflow ui
+```
+
+Open http://localhost:8765 to start runs and watch progress, agent output, a color-coded diff, test results and
+PR links. Run history is saved to `~/.agentflow-history.json`. The server only listens on 127.0.0.1.
+
 ## Custom agents and local models
 
 Add any CLI that edits files in the current directory to `~/.agentflow.toml`. `{prompt}` is replaced with the issue text.
