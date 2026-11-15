@@ -92,6 +92,24 @@ def feedback_since(pr, inline, since):
             if when > since and assoc in TRUSTED and body.strip() and MARKER not in body]
 
 
+def failed_checks(checks):
+    """Unique failing checks as (label, GitHub Actions job id or None, link). Push and PR events duplicate jobs."""
+    seen, out = set(), []
+    for c in checks:
+        label = f"{c.get('workflow') or ''} / {c['name']}".strip(" /")
+        if c["bucket"] != "fail" or label in seen:
+            continue
+        seen.add(label)
+        m = re.search(r"/actions/runs/\d+/job/(\d+)", c.get("link") or "")
+        out.append((label, m and m.group(1), c.get("link")))
+    return out
+
+
+def clean_log(text):
+    """Drop the 'job<TAB>step<TAB>timestamp ' prefix gh puts on every Actions log line."""
+    return "\n".join(re.sub(r"^[^\t]*\t[^\t]*\t\S+ ?", "", line) for line in text.splitlines())
+
+
 TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}
 
 
@@ -168,23 +186,33 @@ def fix_pr(repo, num, agent, test_cmd, log, trust=False):  # trust unused: comme
         raise RuntimeError("PRs from forks are not supported yet")
     inline = [c for page in json.loads(run(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/pulls/{num}/comments"])) for c in page]
     feedback = feedback_since(pr, inline, pr["commits"][-1]["committedDate"])
-    if not feedback:
-        raise RuntimeError("no new feedback from collaborators since the last commit; nothing to do")
-    log("status", f"{len(feedback)} new comment(s) to address")
+    # gh exits non-zero whenever checks fail, are pending, or don't exist; the JSON on stdout is all we need
+    checks = subprocess.run(["gh", "pr", "checks", str(num), "-R", repo, "--json", "name,bucket,link,workflow"],
+                            capture_output=True, **TEXT).stdout
+    ci = []
+    for label, job, link in failed_checks(json.loads(checks or "[]")):
+        logtext = clean_log(run(["gh", "run", "view", "--job", job, "-R", repo, "--log-failed"]))[-LOG_LIMIT:] if job \
+            else f"(not a GitHub Actions check, no log available; see {link})"
+        ci.append(f"Failing check \"{label}\":\n```\n{logtext}\n```")
+    if not feedback and not ci:
+        raise RuntimeError("no new feedback from collaborators and no failing checks; nothing to do")
+    summary = f"{len(feedback)} comment(s) and {len(ci)} failing check(s)"
+    log("status", f"To address: {summary}")
     with tempfile.TemporaryDirectory() as d:
         log("status", f"Cloning {repo}")
         run(["gh", "repo", "clone", repo, d])
         run(["gh", "pr", "checkout", str(num)], d)
         prompt = (f"You are updating the existing pull request \"{pr['title']}\" in the current repo. "
-                  "Address this review feedback by editing files.\n\n" + "\n\n".join(feedback))
+                  "Edit files to address the review feedback and fix the failing CI checks below.\n\n"
+                  + "\n\n".join(feedback + ci))
         passed, test_cmd, tail = agent_and_tests(d, agent, prompt, test_cmd, log)
         log("status", "Pushing to the PR")
-        run(["git", "commit", "-m", f"Address review feedback\n\n{len(feedback)} comment(s) on #{num}"], d)
+        run(["git", "commit", "-m", f"Address review feedback and CI\n\n{summary} on #{num}"], d)
         run(["git", "push"], d)
         if passed is not None:  # draft while tests fail, ready once they pass; errors just mean it already is
             subprocess.run(["gh", "pr", "ready", str(num), *([] if passed else ["--undo"])], cwd=d, capture_output=True)
         run(["gh", "pr", "comment", str(num), "--body",
-             f"{MARKER}\nagentflow addressed {len(feedback)} comment(s).\n\n{test_note(passed, test_cmd, tail)}"], d)
+             f"{MARKER}\nagentflow addressed {summary}.\n\n{test_note(passed, test_cmd, tail)}"], d)
         return pr["url"]
 
 

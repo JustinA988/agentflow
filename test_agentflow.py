@@ -2,8 +2,24 @@ import pytest
 
 import json
 
-from agentflow import (BUILTIN_AGENTS, MARKER, build_cmd, check_author, detect_test_cmd, feedback_since, load_agents,
-                       parse_ref, readable)
+from agentflow import (BUILTIN_AGENTS, MARKER, build_cmd, check_author, clean_log, detect_test_cmd, failed_checks,
+                       feedback_since, load_agents, parse_ref, readable)
+
+
+def test_failed_checks_dedupes_and_finds_job():
+    link = "https://github.com/o/r/actions/runs/1/job/22"
+    checks = [
+        {"name": "pytest", "workflow": "test", "bucket": "fail", "link": link},
+        {"name": "pytest", "workflow": "test", "bucket": "fail", "link": link.replace("22", "33")},  # push+PR duplicate
+        {"name": "lint", "workflow": "test", "bucket": "pass", "link": link},
+        {"name": "ci/external", "workflow": "", "bucket": "fail", "link": "https://ci.example/9"},
+    ]
+    assert failed_checks(checks) == [("test / pytest", "22", link), ("ci/external", None, "https://ci.example/9")]
+
+
+def test_clean_log():
+    raw = "pytest\tRun pytest\t2026-11-15T18:50:23.9Z E   assert -1 == 5\npytest\tRun pytest\t2026-11-15T18:50:24.0Z 1 failed"
+    assert clean_log(raw) == "E   assert -1 == 5\n1 failed"
 
 
 def test_check_author():

@@ -18,7 +18,7 @@ Issues written by someone without write access to the repo are refused, since an
 public repo and the agent edits files and pushes under your account. Read the issue first, then pass
 `--trust-author` (or tick **Trust author** in the web UI) to run it anyway.
 
-## Fix a PR from review comments
+## Fix a PR from review comments and failing CI
 
 Point agentflow at a PR instead of an issue:
 
@@ -26,7 +26,8 @@ Point agentflow at a PR instead of an issue:
 agentflow owner/repo#45
 ```
 
-It checks out the PR branch, gives the agent every review comment posted since the PR's last commit, runs the tests,
+It checks out the PR branch, gives the agent every review comment posted since the PR's last commit plus the logs of
+any failing checks (GitHub Actions logs are fetched; other CI systems get a link), runs the tests,
 pushes, marks the PR draft or ready based on the test result, and comments with a summary. Only comments from the
 repo's owner, members and collaborators are used, so strangers can't steer the agent. PRs from forks aren't supported yet.
 
