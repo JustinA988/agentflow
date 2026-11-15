@@ -11,7 +11,7 @@ from pathlib import Path
 
 from urllib.parse import parse_qs, urlsplit
 
-from agentflow import load_agents, parse_ref, resolve, run
+from agentflow import load_agents, parse_ref, resolve, run, with_model
 
 PORT = 8765
 HISTORY = Path.home() / ".agentflow-history.json"
@@ -43,12 +43,14 @@ def list_items(repo):
     return sorted(out, key=lambda i: -i["number"])
 
 
-def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False):
+def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False, model=""):
     parse_ref(ref)  # validate before starting a thread
     if agent_name not in agents:
         raise ValueError(f"unknown agent {agent_name!r}")
+    agent = with_model(agents[agent_name], model)
     with lock:
-        r = {"id": max((x["id"] for x in runs), default=0) + 1, "ref": ref, "agent": agent_name, "status": "running",
+        r = {"id": max((x["id"] for x in runs), default=0) + 1, "ref": ref, "status": "running",
+             "agent": f"{agent_name} {model}".strip(),
              "started": time.time(), "pr": None, "error": None, "events": []}
         runs.insert(0, r)
 
@@ -58,7 +60,7 @@ def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False):
 
     def work():
         try:
-            r["pr"] = resolve(ref, agents[agent_name], test_cmd or None, log, trust)
+            r["pr"] = resolve(ref, agent, test_cmd or None, log, trust)
             r["status"] = "draft" if any(k == "tests" and t.startswith("FAILED") for k, t in r["events"]) else "done"
         except subprocess.CalledProcessError as e:
             r["status"], r["error"] = "failed", f"{' '.join(map(str, e.cmd[:3]))} failed: {e.stderr or e}"
@@ -111,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
             r = start_run(body.get("ref", "").strip(), body.get("agent", "claude"), body.get("test", "").strip(), self.agents,
-                          trust=body.get("trust") == "on")
+                          trust=body.get("trust") == "on", model=body.get("model", "").strip())
         except ValueError as e:
             return self.send(400, {"error": str(e)})
         self.send(200, {"id": r["id"]})
@@ -159,6 +161,7 @@ pre{background:var(--code);border:1px solid var(--border);border-radius:6px;padd
 <header><h1>agentflow</h1>
 <form id="f"><input id="ref" name="ref" placeholder="owner/repo#123" required aria-label="Issue or PR (owner/repo#number)" title="Issue: opens a PR. PR: fixes new review comments.">
 <select name="agent" id="agent" aria-label="Agent"></select>
+<input name="model" placeholder="model (ollama only)" aria-label="Model, for agents that take one" size="14">
 <input name="test" placeholder="test command (auto)" aria-label="Test command">
 <label class="muted" title="Allow an issue written by someone without write access. Read it first."><input type="checkbox" name="trust"> Trust author</label>
 <button>Run</button><span id="err" role="alert"></span></form></header>

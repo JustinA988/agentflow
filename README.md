@@ -40,21 +40,35 @@ agentflow ui
 Open http://localhost:8765 to start runs and watch progress, agent output, a color-coded diff, test results and
 PR links. Run history is saved to `~/.agentflow-history.json`. The server only listens on 127.0.0.1.
 
-## Custom agents and local models
+## Local models (free, offline)
 
-Add any CLI that edits files in the current directory to `~/.agentflow.toml`. `{prompt}` is replaced with the issue text.
+Runs entirely on your machine with [Ollama](https://ollama.com): no subscription, no key, no internet.
+Claude Code does the file editing; your local model does the thinking.
 
-```toml
-# Claude Code driving a local Ollama model (no login, no key)
-[agents.local]
-cmd = ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits", "--model", "qwen3.5:9b"]
-env = { ANTHROPIC_BASE_URL = "http://localhost:11434", ANTHROPIC_AUTH_TOKEN = "ollama", ANTHROPIC_API_KEY = "" }
-
-[agents.gemini]
-cmd = ["gemini", "-p", "{prompt}", "--yolo"]
+```bash
+ollama pull qwen3.5:9b
+agentflow owner/repo#123 --agent ollama --model qwen3.5:9b
 ```
 
-Then `agentflow owner/repo#123 --agent local`.
+In the web UI, pick `ollama` and type the model name. Any Ollama model with tool calling works; bigger models make
+fewer mistakes. It uses `claude --bare`, so your global Claude Code setup (CLAUDE.md, hooks, plugins) stays out of the
+way, and the model only gets file tools (no shell).
+
+## Custom agents
+
+Add any CLI that edits files in the current directory to `~/.agentflow.toml`. `{prompt}` is replaced with the issue
+text and `{model}` with `--model`.
+
+```toml
+[agents.gemini]
+cmd = ["gemini", "-p", "{prompt}", "--yolo"]
+
+[agents.lmstudio]  # any Anthropic-compatible local server
+cmd = ["claude", "--bare", "-p", "{prompt}", "--model", "{model}", "--permission-mode", "acceptEdits"]
+env = { ANTHROPIC_BASE_URL = "http://localhost:1234", ANTHROPIC_API_KEY = "local" }
+```
+
+Then `agentflow owner/repo#123 --agent gemini`.
 
 ## Roadmap
 - PR review, fix PR feedback, CI fix-up

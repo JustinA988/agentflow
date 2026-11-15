@@ -3,7 +3,7 @@ import pytest
 import json
 
 from agentflow import (BUILTIN_AGENTS, MARKER, build_cmd, check_author, clean_log, detect_test_cmd, failed_checks,
-                       feedback_since, load_agents, parse_ref, readable)
+                       feedback_since, load_agents, parse_ref, readable, with_model)
 
 
 def test_failed_checks_dedupes_and_finds_job():
@@ -20,6 +20,17 @@ def test_failed_checks_dedupes_and_finds_job():
 def test_clean_log():
     raw = "pytest\tRun pytest\t2026-11-15T18:50:23.9Z E   assert -1 == 5\npytest\tRun pytest\t2026-11-15T18:50:24.0Z 1 failed"
     assert clean_log(raw) == "E   assert -1 == 5\n1 failed"
+
+
+def test_with_model():
+    ollama = BUILTIN_AGENTS["ollama"]
+    cmd = build_cmd(with_model(ollama, "qwen3.5:9b"), "fix {model} bug")
+    assert cmd[cmd.index("--model") + 1] == "qwen3.5:9b" and "fix {model} bug" in cmd
+    with pytest.raises(ValueError, match="needs a model"):
+        with_model(ollama, "")
+    with pytest.raises(ValueError, match="doesn't take a model"):
+        with_model(BUILTIN_AGENTS["claude"], "qwen3.5:9b")
+    assert with_model(BUILTIN_AGENTS["claude"], None)["cmd"][0] == "claude"
 
 
 def test_check_author():

@@ -19,6 +19,13 @@ BUILTIN_AGENTS = {
     # stream-json so output arrives live; plain -p prints only at the end
     "claude": {"cmd": ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"]},
     "codex": {"cmd": ["codex", "exec", "--full-auto", "{prompt}"]},
+    # Claude Code as the harness, any Ollama model as the brain. --bare skips the user's global CLAUDE.md, hooks
+    # and plugins, which swamp small models; file tools only. Ollama ignores the key's value; it is not a real key.
+    "ollama": {
+        "cmd": ["claude", "--bare", "-p", "{prompt}", "--model", "{model}", "--tools", "Read,Edit,Write,Glob,Grep",
+                "--strict-mcp-config", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"],
+        "env": {"ANTHROPIC_BASE_URL": "http://localhost:11434", "ANTHROPIC_API_KEY": "ollama"},
+    },
 }
 CONFIG = Path.home() / ".agentflow.toml"
 LOG_LIMIT = 3000  # GitHub PR bodies cap at 65k chars; keep the tail of the log only
@@ -44,8 +51,19 @@ def parse_ref(ref):
     return m.group(1), int(m.group(2))
 
 
+def with_model(agent, model):
+    """Fill the agent's {model} slot. Agents with a slot need a model; agents without one can't take one."""
+    takes_model = any("{model}" in str(x) for x in agent["cmd"])
+    if takes_model and not model:
+        raise ValueError("this agent needs a model, e.g. --model qwen3.5:9b (see `ollama list`)")
+    if model and not takes_model:
+        raise ValueError("this agent doesn't take a model; add \"{model}\" to its cmd in ~/.agentflow.toml")
+    return {**agent, "model": model}
+
+
 def build_cmd(agent, prompt):
-    return [a.replace("{prompt}", prompt) for a in agent["cmd"]]
+    # prompt last, so a "{model}" typed inside an issue is never substituted
+    return [a.replace("{model}", agent.get("model") or "").replace("{prompt}", prompt) for a in agent["cmd"]]
 
 
 def detect_test_cmd(repo):
@@ -236,11 +254,12 @@ def main():
     p.add_argument("ref", help="owner/repo#number: an issue (opens a PR) or a PR (addresses new review comments)")
     p.add_argument("--agent", choices=agents, default="claude")
     p.add_argument("--test", help="test command to run before pushing (default: auto-detect)")
+    p.add_argument("--model", help="model for agents that take one, e.g. --agent ollama --model qwen3.5:9b")
     p.add_argument("--trust-author", action="store_true", help="run on an issue from a non-collaborator (read it first)")
     a = p.parse_args()
     try:
-        resolve(a.ref, agents[a.agent], a.test, trust=a.trust_author)
-    except (RuntimeError, subprocess.CalledProcessError) as e:
+        resolve(a.ref, with_model(agents[a.agent], a.model), a.test, trust=a.trust_author)
+    except (ValueError, RuntimeError, subprocess.CalledProcessError) as e:
         sys.exit(f"error: {e}" + (f"\n{e.stderr}" if getattr(e, "stderr", None) else ""))
 
 
