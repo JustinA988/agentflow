@@ -15,7 +15,8 @@ import tomllib
 from pathlib import Path
 
 BUILTIN_AGENTS = {
-    "claude": {"cmd": ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits"]},
+    # stream-json so output arrives live; plain -p prints only at the end
+    "claude": {"cmd": ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"]},
     "codex": {"cmd": ["codex", "exec", "--full-auto", "{prompt}"]},
 }
 CONFIG = Path.home() / ".agentflow.toml"
@@ -56,6 +57,27 @@ def detect_test_cmd(repo):
     return None
 
 
+def readable(line):
+    """Turn a Claude Code stream-json line into text; pass other agents' plain lines through. None = skip."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return line
+    if not isinstance(event, dict):
+        return line
+    if event.get("type") != "assistant":
+        return None  # system/hook/tool_result/result events are noise here
+    out = []
+    for part in event.get("message", {}).get("content", []):
+        if part.get("type") == "text":
+            out.append(part["text"])
+        elif part.get("type") == "tool_use":
+            args = part.get("input", {})
+            target = args.get("file_path") or args.get("command") or args.get("pattern") or ""
+            out.append(f"→ {part.get('name')} {Path(target).name if 'file_path' in args else target}".rstrip())
+    return "\n".join(out) or None
+
+
 TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}
 
 
@@ -79,7 +101,8 @@ def issue_to_pr(ref, agent, test_cmd=None, log=lambda kind, text: print(text)):
         p = subprocess.Popen(build_cmd(agent, prompt), cwd=d, env=env, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **TEXT)
         for line in p.stdout:
-            log("agent", line.rstrip("\n"))
+            if (text := readable(line.rstrip("\n"))) is not None:
+                log("agent", text)
         if p.wait() != 0:
             raise RuntimeError("agent failed (is it installed and logged in?); no PR opened")
         run(["git", "add", "-A"], d)

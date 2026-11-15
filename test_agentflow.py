@@ -1,6 +1,18 @@
 import pytest
 
-from agentflow import BUILTIN_AGENTS, build_cmd, detect_test_cmd, load_agents, parse_ref
+import json
+
+from agentflow import BUILTIN_AGENTS, build_cmd, detect_test_cmd, load_agents, parse_ref, readable
+
+
+def test_readable():
+    msg = lambda *parts: json.dumps({"type": "assistant", "message": {"content": list(parts)}})
+    assert readable("plain codex output") == "plain codex output"
+    assert readable('{"type": "system", "subtype": "init"}') is None
+    assert readable(msg({"type": "text", "text": "Fixing it"})) == "Fixing it"
+    assert readable(msg({"type": "tool_use", "name": "Edit", "input": {"file_path": "C:\\r\\calc.py"}})) == "→ Edit calc.py"
+    assert readable(msg({"type": "tool_use", "name": "Bash", "input": {"command": "pytest -q"}})) == "→ Bash pytest -q"
+    assert readable("[1, 2]") == "[1, 2]"
 
 
 def test_parse_ref():
