@@ -14,6 +14,18 @@ It clones the repo to a temp dir, branches, runs the agent on the issue, runs th
 If tests fail, the PR opens as a **draft** with the failure log. Without `--test`, the test command is auto-detected
 (npm, cargo, go, pytest); if none is found the PR says tests were not run.
 
+## Fix a PR from review comments
+
+Point agentflow at a PR instead of an issue:
+
+```bash
+agentflow owner/repo#45
+```
+
+It checks out the PR branch, gives the agent every review comment posted since the PR's last commit, runs the tests,
+pushes, marks the PR draft or ready based on the test result, and comments with a summary. Only comments from the
+repo's owner, members and collaborators are used, so strangers can't steer the agent. PRs from forks aren't supported yet.
+
 ## Web UI
 
 ```bash

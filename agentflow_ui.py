@@ -9,7 +9,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agentflow import issue_to_pr, load_agents, parse_ref
+from agentflow import load_agents, parse_ref, resolve
 
 PORT = 8765
 HISTORY = Path.home() / ".agentflow-history.json"
@@ -45,7 +45,7 @@ def start_run(ref, agent_name, test_cmd, agents, history=HISTORY):
 
     def work():
         try:
-            r["pr"] = issue_to_pr(ref, agents[agent_name], test_cmd or None, log)
+            r["pr"] = resolve(ref,agents[agent_name], test_cmd or None, log)
             r["status"] = "draft" if any(k == "tests" and t.startswith("FAILED") for k, t in r["events"]) else "done"
         except subprocess.CalledProcessError as e:
             r["status"], r["error"] = "failed", f"{' '.join(map(str, e.cmd[:3]))} failed: {e.stderr or e}"
@@ -131,7 +131,7 @@ pre{background:var(--code);border:1px solid var(--border);border-radius:6px;padd
 #err{color:var(--bad)}a{color:var(--accent)}
 </style></head><body>
 <header><h1>agentflow</h1>
-<form id="f"><input id="ref" name="ref" placeholder="owner/repo#123" required aria-label="Issue (owner/repo#number)">
+<form id="f"><input id="ref" name="ref" placeholder="owner/repo#123" required aria-label="Issue or PR (owner/repo#number)" title="Issue: opens a PR. PR: fixes new review comments.">
 <select name="agent" id="agent" aria-label="Agent"></select>
 <input name="test" placeholder="test command (auto)" aria-label="Test command">
 <button>Run</button><span id="err" role="alert"></span></form></header>
