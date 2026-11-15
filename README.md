@@ -31,6 +31,16 @@ any failing checks (GitHub Actions logs are fetched; other CI systems get a link
 pushes, marks the PR draft or ready based on the test result, and comments with a summary. Only comments from the
 repo's owner, members and collaborators are used, so strangers can't steer the agent. PRs from forks aren't supported yet.
 
+## Review a PR
+
+```bash
+agentflow owner/repo#45 --review
+```
+
+The agent reads the diff and surrounding code in a throwaway checkout and posts a review on the PR (bugs, risks,
+suggestions). Nothing is pushed. Run `agentflow owner/repo#45` afterwards and the review counts as feedback, so
+the agent fixes what it found. In the web UI, tick **Review only**.
+
 ## Web UI
 
 ```bash

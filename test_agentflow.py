@@ -3,7 +3,7 @@ import pytest
 import json
 
 from agentflow import (BUILTIN_AGENTS, MARKER, build_cmd, check_author, clean_log, detect_test_cmd, failed_checks,
-                       feedback_since, load_agents, parse_ref, readable, with_model)
+                       feedback_since, final_answer, load_agents, parse_ref, readable, with_model)
 
 
 def test_failed_checks_dedupes_and_finds_job():
@@ -20,6 +20,15 @@ def test_failed_checks_dedupes_and_finds_job():
 def test_clean_log():
     raw = "pytest\tRun pytest\t2026-11-15T18:50:23.9Z E   assert -1 == 5\npytest\tRun pytest\t2026-11-15T18:50:24.0Z 1 failed"
     assert clean_log(raw) == "E   assert -1 == 5\n1 failed"
+
+
+def test_final_answer():
+    text = lambda t: json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}})
+    tool = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {}}]}})
+    result = json.dumps({"type": "result", "result": " Looks good. \n"})
+    assert final_answer([text("Let me look."), tool, text("Looks good."), result]) == "Looks good."
+    assert final_answer([text("Let me look."), tool, text("No bugs.")]) == "Let me look.\nNo bugs."
+    assert final_answer(["plain codex", "review text"]) == "plain codex\nreview text"
 
 
 def test_with_model():

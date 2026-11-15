@@ -43,7 +43,7 @@ def list_items(repo):
     return sorted(out, key=lambda i: -i["number"])
 
 
-def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False, model=""):
+def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False, model="", review=False):
     parse_ref(ref)  # validate before starting a thread
     if agent_name not in agents:
         raise ValueError(f"unknown agent {agent_name!r}")
@@ -60,7 +60,7 @@ def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False, m
 
     def work():
         try:
-            r["pr"] = resolve(ref, agent, test_cmd or None, log, trust)
+            r["pr"] = resolve(ref, agent, test_cmd or None, log, trust, review)
             r["status"] = "draft" if any(k == "tests" and t.startswith("FAILED") for k, t in r["events"]) else "done"
         except subprocess.CalledProcessError as e:
             r["status"], r["error"] = "failed", f"{' '.join(map(str, e.cmd[:3]))} failed: {e.stderr or e}"
@@ -113,7 +113,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
             r = start_run(body.get("ref", "").strip(), body.get("agent", "claude"), body.get("test", "").strip(), self.agents,
-                          trust=body.get("trust") == "on", model=body.get("model", "").strip())
+                          trust=body.get("trust") == "on", model=body.get("model", "").strip(),
+                          review=body.get("review") == "on")
         except ValueError as e:
             return self.send(400, {"error": str(e)})
         self.send(200, {"id": r["id"]})
@@ -163,6 +164,7 @@ pre{background:var(--code);border:1px solid var(--border);border-radius:6px;padd
 <select name="agent" id="agent" aria-label="Agent"></select>
 <input name="model" placeholder="model (ollama only)" aria-label="Model, for agents that take one" size="14">
 <input name="test" placeholder="test command (auto)" aria-label="Test command">
+<label class="muted" title="PRs only: post a code review instead of changing the PR"><input type="checkbox" name="review"> Review only</label>
 <label class="muted" title="Allow an issue written by someone without write access. Read it first."><input type="checkbox" name="trust"> Trust author</label>
 <button>Run</button><span id="err" role="alert"></span></form></header>
 <main><aside>
