@@ -97,6 +97,7 @@ def test_readable():
     assert readable('{"type": "system", "subtype": "init"}') is None
     assert readable(msg({"type": "text", "text": "Fixing it"})) == "Fixing it"
     assert readable(msg({"type": "tool_use", "name": "Edit", "input": {"file_path": "C:\\r\\calc.py"}})) == "→ Edit calc.py"
+    assert readable(msg({"type": "tool_use", "name": "Edit", "input": {"file_path": "/tmp/r/calc.py"}})) == "→ Edit calc.py"
     assert readable(msg({"type": "tool_use", "name": "Bash", "input": {"command": "pytest -q"}})) == "→ Bash pytest -q"
     assert readable("[1, 2]") == "[1, 2]"
 

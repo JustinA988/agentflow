@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 BUILTIN_AGENTS = {
     # stream-json so output arrives live; plain -p prints only at the end
@@ -97,7 +97,7 @@ def readable(line):
         elif part.get("type") == "tool_use":
             args = part.get("input", {})
             target = args.get("file_path") or args.get("command") or args.get("pattern") or ""
-            out.append(f"→ {part.get('name')} {Path(target).name if 'file_path' in args else target}".rstrip())
+            out.append(f"→ {part.get('name')} {PureWindowsPath(target).name if 'file_path' in args else target}".rstrip())
     return "\n".join(out) or None
 
 
