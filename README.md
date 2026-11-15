@@ -5,7 +5,7 @@ Issue in, PR out. Uses an AI CLI you're already logged in to (Claude Code, Codex
 Needs: Python 3.11+, `git`, `gh` (authenticated), and an agent CLI installed and signed in.
 
 ```bash
-pip install -e .
+pip install git+https://github.com/JustinA988/agentflow
 agentflow owner/repo#123 --agent claude
 agentflow owner/repo#123 --test "npm run test:unit"
 ```
@@ -99,5 +99,24 @@ env = { ANTHROPIC_BASE_URL = "http://localhost:1234", ANTHROPIC_API_KEY = "local
 
 Then `agentflow owner/repo#123 --agent gemini`.
 
-## Roadmap
-- PR review, fix PR feedback, CI fix-up
+## Safety
+
+The agent edits files with your permissions and agentflow pushes with your `gh` login, so treat every run like
+giving someone your keyboard:
+
+- Issue authors and PR commenters without write access are ignored unless you opt in (`--trust-author`).
+- Claude Code runs with `acceptEdits`; Codex runs with `--full-auto` (its sandbox). Pick agents you trust.
+- Work happens in a temp clone, never in your own checkout. PRs from forks are refused.
+- The web UI listens on 127.0.0.1 only and rejects other Host headers and non-JSON posts.
+
+## Limits
+
+PRs from forks aren't supported. Pending CI checks are ignored (only finished failures count). Diffs over 40 KB are
+cut short for review. The web UI lists the newest 50 issues and 50 PRs.
+
+## Development
+
+```bash
+pip install pytest -e .
+python -m pytest
+```
