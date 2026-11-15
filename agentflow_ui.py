@@ -9,7 +9,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agentflow import load_agents, parse_ref, resolve
+from urllib.parse import parse_qs, urlsplit
+
+from agentflow import load_agents, parse_ref, resolve, run
 
 PORT = 8765
 HISTORY = Path.home() / ".agentflow-history.json"
@@ -28,6 +30,17 @@ def save_history(path=HISTORY):
     with lock:
         data = json.dumps(runs)
     path.write_text(data, encoding="utf-8")
+
+
+def list_items(repo):
+    """Open issues and PRs for repo, newest first."""
+    parse_ref(f"{repo}#1")  # validates owner/repo before it reaches gh
+    fields = ["--json", "number,title,author", "--limit", "50"]
+    out = []
+    for kind in ("issue", "pr"):
+        for i in json.loads(run(["gh", kind, "list", "-R", repo, *fields])):
+            out.append({"kind": kind, "number": i["number"], "title": i["title"], "author": i["author"]["login"]})
+    return sorted(out, key=lambda i: -i["number"])
 
 
 def start_run(ref, agent_name, test_cmd, agents, history=HISTORY):
@@ -80,6 +93,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/runs":
             with lock:
                 return self.send(200, {"runs": runs, "agents": list(self.agents)})
+        url = urlsplit(self.path)
+        if url.path == "/api/items":
+            try:
+                return self.send(200, {"items": list_items(parse_qs(url.query).get("repo", [""])[0].strip())})
+            except ValueError as e:
+                return self.send(400, {"error": str(e)})
+            except subprocess.CalledProcessError as e:
+                return self.send(400, {"error": (e.stderr or str(e)).strip()})
         self.send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -122,7 +143,11 @@ input,select,button{font:inherit;padding:6px 10px;border:1px solid var(--border)
 input[name=ref]{min-width:240px;flex:1}button{background:var(--accent);color:#fff;border:0;cursor:pointer}
 main{display:grid;grid-template-columns:280px 1fr;min-height:calc(100vh - 60px)}
 @media (max-width:760px){main{grid-template-columns:1fr}}
-nav{border-right:1px solid var(--border);overflow:auto}nav button{display:block;width:100%;text-align:left;background:none;color:var(--text);border-radius:0;border-bottom:1px solid var(--border);padding:10px 16px}
+aside{border-right:1px solid var(--border);overflow:auto}
+#rf{padding:10px 16px;border-bottom:1px solid var(--border);flex:none}#rf input{flex:1;min-width:0}
+.item{display:flex;gap:8px;align-items:flex-start;justify-content:space-between;padding:8px 16px;border-bottom:1px solid var(--border)}
+.item button{flex:none;padding:2px 10px}.tag{font-size:11px;border:1px solid var(--border);border-radius:4px;padding:0 4px;margin-right:4px}
+.pad{padding:8px 16px;margin:0}.side{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:14px 16px 4px}nav button{display:block;width:100%;text-align:left;background:none;color:var(--text);border-radius:0;border-bottom:1px solid var(--border);padding:10px 16px}
 nav button[aria-current=true]{background:var(--panel)}.muted{color:var(--muted);font-size:12px}
 .running{color:var(--accent)}.done{color:var(--ok)}.failed{color:var(--bad)}.draft{color:var(--warn)}
 section{padding:16px;overflow:auto}h2{font-size:15px;margin:20px 0 6px}
@@ -135,7 +160,10 @@ pre{background:var(--code);border:1px solid var(--border);border-radius:6px;padd
 <select name="agent" id="agent" aria-label="Agent"></select>
 <input name="test" placeholder="test command (auto)" aria-label="Test command">
 <button>Run</button><span id="err" role="alert"></span></form></header>
-<main><nav id="list" aria-label="Run history"></nav><section id="detail"><p class="muted">Start a run or pick one from the history.</p></section></main>
+<main><aside>
+<form id="rf"><input id="repo" placeholder="owner/repo" aria-label="Repository to list issues and PRs from" required><button>Load</button></form>
+<div id="items" aria-label="Open issues and PRs"></div>
+<h3 class="side">History</h3><nav id="list" aria-label="Run history"></nav></aside><section id="detail"><p class="muted">Start a run or pick one from the history.</p></section></main>
 <script>
 let sel=null,data={runs:[]},lastKey='';
 const $=s=>document.querySelector(s),el=(t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e};
@@ -164,4 +192,15 @@ function render(){
 }
 async function poll(){try{data=await (await fetch('/api/runs')).json();if(sel==null&&data.runs[0])sel=data.runs[0].id;render()}catch(e){}}
 poll();setInterval(poll,1000);
+$('#rf').onsubmit=async e=>{e.preventDefault();const repo=$('#repo').value.trim();try{localStorage.setItem('af-repo',repo)}catch(_){}
+ const box=$('#items');box.replaceChildren(el('p','muted pad','Loading…'));
+ const r=await fetch('/api/items?repo='+encodeURIComponent(repo)),j=await r.json();
+ if(!r.ok)return box.replaceChildren(el('p','failed pad',j.error));
+ box.replaceChildren(...(j.items.length?j.items.map(i=>{const row=el('div','item'),t=el('div');
+  t.append(el('span','tag',i.kind==='pr'?'PR':'Issue'),`#${i.number} ${i.title}`,el('div','muted','@'+i.author));
+  const b=el('button',null,'Run');b.setAttribute('aria-label',`Run agent on ${i.kind==='pr'?'PR':'issue'} #${i.number}`);
+  b.onclick=()=>{$('#ref').value=`${repo}#${i.number}`;$('#f').requestSubmit()};row.append(t,b);return row})
+  :[el('p','muted pad','No open issues or PRs.')]))};
+try{$('#repo').value=localStorage.getItem('af-repo')||''}catch(_){}
+if($('#repo').value)$('#rf').requestSubmit();
 </script></body></html>"""

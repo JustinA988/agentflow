@@ -41,6 +41,15 @@ def test_rejects_bad_input(server):
     assert req(server, "POST", "/api/run", {"ref": "a/b#1", "agent": "ghost"})[0] == 400
 
 
+def test_items_endpoint(server, monkeypatch):
+    fake = {"issue": '[{"number": 3, "title": "bug", "author": {"login": "a"}}]',
+            "pr": '[{"number": 4, "title": "fix", "author": {"login": "b"}}]'}
+    monkeypatch.setattr(ui, "run", lambda cmd: fake[cmd[1]])
+    status, body = req(server, "GET", "/api/items?repo=octo/cat")
+    assert status == 200 and [(i["kind"], i["number"]) for i in json.loads(body)["items"]] == [("pr", 4), ("issue", 3)]
+    assert req(server, "GET", "/api/items?repo=--help")[0] == 400
+
+
 def test_history_roundtrip(tmp_path):
     ui.runs[:] = [{"id": 1, "status": "done"}]
     ui.save_history(tmp_path / "h.json")
