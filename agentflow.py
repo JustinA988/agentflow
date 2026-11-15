@@ -135,8 +135,17 @@ def test_note(passed, test_cmd, tail):
     return f"**Tests failed:** `{test_cmd}`\n\n```\n{tail}\n```"
 
 
-def issue_to_pr(repo, num, agent, test_cmd, log):
-    issue = json.loads(run(["gh", "issue", "view", str(num), "-R", repo, "--json", "title,body"]))
+def check_author(issue, trust):
+    """Refuse issues from people without write access unless the user vouched for this one."""
+    if issue["author_association"] not in TRUSTED and not trust:
+        raise RuntimeError(f"issue author @{issue['user']['login']} is not a collaborator ({issue['author_association']}); "
+                           "read the issue, then rerun with --trust-author (or tick 'Trust author') if it is safe")
+
+
+def issue_to_pr(repo, num, agent, test_cmd, log, trust=False):
+    issue = json.loads(run(["gh", "api", f"repos/{repo}/issues/{num}"]))
+    check_author(issue, trust)
+    issue["body"] = issue["body"] or ""
     with tempfile.TemporaryDirectory() as d:
         log("status", f"Cloning {repo}")
         run(["gh", "repo", "clone", repo, d])
@@ -151,7 +160,7 @@ def issue_to_pr(repo, num, agent, test_cmd, log):
                     *(["--draft"] if passed is False else [])], d).strip()
 
 
-def fix_pr(repo, num, agent, test_cmd, log):
+def fix_pr(repo, num, agent, test_cmd, log, trust=False):  # trust unused: comments are filtered per author
     pr = json.loads(run(["gh", "pr", "view", str(num), "-R", repo, "--json",
                          "title,url,headRefName,isCrossRepository,comments,reviews,commits"]))
     if pr["isCrossRepository"]:
@@ -179,13 +188,13 @@ def fix_pr(repo, num, agent, test_cmd, log):
         return pr["url"]
 
 
-def resolve(ref, agent, test_cmd=None, log=lambda kind, text: print(text)):
+def resolve(ref, agent, test_cmd=None, log=lambda kind, text: print(text), trust=False):
     """Issue -> new PR; PR -> push fixes for its review comments. log(kind, text) gets progress events:
     status, agent, diff, tests, pr. Raises RuntimeError or CalledProcessError on failure."""
     repo, num = parse_ref(ref)
     is_pr = subprocess.run(["gh", "pr", "view", str(num), "-R", repo, "--json", "number"], capture_output=True).returncode == 0
     log("status", f"Reading {'PR' if is_pr else 'issue'} {ref}")
-    url = (fix_pr if is_pr else issue_to_pr)(repo, num, agent, test_cmd, log)
+    url = (fix_pr if is_pr else issue_to_pr)(repo, num, agent, test_cmd, log, trust)
     log("pr", url)
     return url
 
@@ -199,9 +208,10 @@ def main():
     p.add_argument("ref", help="owner/repo#number: an issue (opens a PR) or a PR (addresses new review comments)")
     p.add_argument("--agent", choices=agents, default="claude")
     p.add_argument("--test", help="test command to run before pushing (default: auto-detect)")
+    p.add_argument("--trust-author", action="store_true", help="run on an issue from a non-collaborator (read it first)")
     a = p.parse_args()
     try:
-        resolve(a.ref, agents[a.agent], a.test)
+        resolve(a.ref, agents[a.agent], a.test, trust=a.trust_author)
     except (RuntimeError, subprocess.CalledProcessError) as e:
         sys.exit(f"error: {e}" + (f"\n{e.stderr}" if getattr(e, "stderr", None) else ""))
 

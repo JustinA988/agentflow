@@ -2,7 +2,18 @@ import pytest
 
 import json
 
-from agentflow import BUILTIN_AGENTS, MARKER, build_cmd, detect_test_cmd, feedback_since, load_agents, parse_ref, readable
+from agentflow import (BUILTIN_AGENTS, MARKER, build_cmd, check_author, detect_test_cmd, feedback_since, load_agents,
+                       parse_ref, readable)
+
+
+def test_check_author():
+    issue = lambda assoc: {"author_association": assoc, "user": {"login": "x"}}
+    for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
+        check_author(issue(assoc), trust=False)
+    for assoc in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"):
+        with pytest.raises(RuntimeError, match="trust-author"):
+            check_author(issue(assoc), trust=False)
+    check_author(issue("NONE"), trust=True)
 
 
 def test_feedback_since_keeps_new_trusted_comments_only():

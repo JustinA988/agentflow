@@ -14,6 +14,10 @@ It clones the repo to a temp dir, branches, runs the agent on the issue, runs th
 If tests fail, the PR opens as a **draft** with the failure log. Without `--test`, the test command is auto-detected
 (npm, cargo, go, pytest); if none is found the PR says tests were not run.
 
+Issues written by someone without write access to the repo are refused, since anyone can open an issue on a
+public repo and the agent edits files and pushes under your account. Read the issue first, then pass
+`--trust-author` (or tick **Trust author** in the web UI) to run it anyway.
+
 ## Fix a PR from review comments
 
 Point agentflow at a PR instead of an issue:

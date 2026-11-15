@@ -43,7 +43,7 @@ def list_items(repo):
     return sorted(out, key=lambda i: -i["number"])
 
 
-def start_run(ref, agent_name, test_cmd, agents, history=HISTORY):
+def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False):
     parse_ref(ref)  # validate before starting a thread
     if agent_name not in agents:
         raise ValueError(f"unknown agent {agent_name!r}")
@@ -58,7 +58,7 @@ def start_run(ref, agent_name, test_cmd, agents, history=HISTORY):
 
     def work():
         try:
-            r["pr"] = resolve(ref,agents[agent_name], test_cmd or None, log)
+            r["pr"] = resolve(ref, agents[agent_name], test_cmd or None, log, trust)
             r["status"] = "draft" if any(k == "tests" and t.startswith("FAILED") for k, t in r["events"]) else "done"
         except subprocess.CalledProcessError as e:
             r["status"], r["error"] = "failed", f"{' '.join(map(str, e.cmd[:3]))} failed: {e.stderr or e}"
@@ -110,7 +110,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, {"error": "not found"})
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-            r = start_run(body.get("ref", "").strip(), body.get("agent", "claude"), body.get("test", "").strip(), self.agents)
+            r = start_run(body.get("ref", "").strip(), body.get("agent", "claude"), body.get("test", "").strip(), self.agents,
+                          trust=body.get("trust") == "on")
         except ValueError as e:
             return self.send(400, {"error": str(e)})
         self.send(200, {"id": r["id"]})
@@ -159,6 +160,7 @@ pre{background:var(--code);border:1px solid var(--border);border-radius:6px;padd
 <form id="f"><input id="ref" name="ref" placeholder="owner/repo#123" required aria-label="Issue or PR (owner/repo#number)" title="Issue: opens a PR. PR: fixes new review comments.">
 <select name="agent" id="agent" aria-label="Agent"></select>
 <input name="test" placeholder="test command (auto)" aria-label="Test command">
+<label class="muted" title="Allow an issue written by someone without write access. Read it first."><input type="checkbox" name="trust"> Trust author</label>
 <button>Run</button><span id="err" role="alert"></span></form></header>
 <main><aside>
 <form id="rf"><input id="repo" placeholder="owner/repo" aria-label="Repository to list issues and PRs from" required><button>Load</button></form>
