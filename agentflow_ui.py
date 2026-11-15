@@ -11,7 +11,7 @@ from pathlib import Path
 
 from urllib.parse import parse_qs, urlsplit
 
-from agentflow import load_agents, parse_ref, resolve, run, with_model
+from agentflow import load_agents, parse_ref, report_failure, resolve, run, watch, with_model
 
 PORT = 8765
 HISTORY = Path.home() / ".agentflow-history.json"
@@ -43,7 +43,8 @@ def list_items(repo):
     return sorted(out, key=lambda i: -i["number"])
 
 
-def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False, model="", review=False):
+def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False, model="", review=False, notify=False):
+    """notify=True (watch mode) also reports a failure as a comment on the issue/PR."""
     parse_ref(ref)  # validate before starting a thread
     if agent_name not in agents:
         raise ValueError(f"unknown agent {agent_name!r}")
@@ -62,10 +63,12 @@ def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False, m
         try:
             r["pr"] = resolve(ref, agent, test_cmd or None, log, trust, review)
             r["status"] = "draft" if any(k == "tests" and t.startswith("FAILED") for k, t in r["events"]) else "done"
-        except subprocess.CalledProcessError as e:
-            r["status"], r["error"] = "failed", f"{' '.join(map(str, e.cmd[:3]))} failed: {e.stderr or e}"
         except Exception as e:  # surface every failure in the UI instead of a dead thread
             r["status"], r["error"] = "failed", str(e)
+            if isinstance(e, subprocess.CalledProcessError):
+                r["error"] = f"{' '.join(map(str, e.cmd[:3]))} failed: {e.stderr or e}"
+            if notify:
+                report_failure(ref, e)
         save_history(history)
 
     threading.Thread(target=work, daemon=True).start()
@@ -73,7 +76,7 @@ def start_run(ref, agent_name, test_cmd, agents, history=HISTORY, trust=False, m
 
 
 class Handler(BaseHTTPRequestHandler):
-    agents = {}
+    agents, watching = {}, []
 
     def send(self, code, body, ctype="application/json"):
         data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
@@ -94,7 +97,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, PAGE, "text/html")
         if self.path == "/api/runs":
             with lock:
-                return self.send(200, {"runs": runs, "agents": list(self.agents)})
+                return self.send(200, {"runs": runs, "agents": list(self.agents), "watching": self.watching})
         url = urlsplit(self.path)
         if url.path == "/api/items":
             try:
@@ -123,11 +126,16 @@ class Handler(BaseHTTPRequestHandler):
         pass  # keep the console quiet; the page shows everything
 
 
-def serve(port=PORT):
+def serve(port=PORT, watch_repos=(), agent_name="claude", model=None, test_cmd=None, interval=60):
     Handler.agents = load_agents()
+    Handler.watching = list(watch_repos)
     runs.extend(r for r in load_history() if r.get("status") != "running")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"agentflow UI: http://localhost:{port}  (Ctrl+C to stop)")
+    if watch_repos:
+        def launch(ref, review):
+            start_run(ref, agent_name, test_cmd, Handler.agents, trust=True, model=model or "", review=review, notify=True)
+        threading.Thread(target=watch, args=(watch_repos, launch, interval), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -159,7 +167,7 @@ pre{background:var(--code);border:1px solid var(--border);border-radius:6px;padd
 .add{background:var(--add);color:var(--addt);display:block}.del{background:var(--del);color:var(--delt);display:block}.hunk{color:var(--accent);display:block}
 #err{color:var(--bad)}a{color:var(--accent)}
 </style></head><body>
-<header><h1>agentflow</h1>
+<header><h1>agentflow</h1><span id="watching" class="muted"></span>
 <form id="f"><input id="ref" name="ref" placeholder="owner/repo#123" required aria-label="Issue or PR (owner/repo#number)" title="Issue: opens a PR. PR: fixes new review comments.">
 <select name="agent" id="agent" aria-label="Agent"></select>
 <input name="model" placeholder="model (ollama only)" aria-label="Model, for agents that take one" size="14">
@@ -184,6 +192,7 @@ function diffPre(text){const p=el('pre');for(const line of text.split('\n')){
 function render(){
  const key=JSON.stringify([data.runs.map(r=>[r.id,r.status,r.events.length]),sel]);if(key===lastKey)return;lastKey=key;
  const ag=$('#agent');if(!ag.options.length)for(const a of data.agents)ag.append(new Option(a,a));
+ $('#watching').textContent=data.watching.length?`● watching ${data.watching.join(', ')}`:'';
  const list=$('#list');list.replaceChildren(...data.runs.map(r=>{const b=el('button');b.setAttribute('aria-current',r.id===sel);
   b.append(el('div',null,r.ref),el('div','muted '+r.status,`${r.status} · ${r.agent} · ${new Date(r.started*1000).toLocaleString()}`));
   b.onclick=()=>{sel=r.id;render()};return b}));

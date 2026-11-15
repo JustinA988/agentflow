@@ -2,6 +2,7 @@ import pytest
 
 import json
 
+import agentflow
 from agentflow import (BUILTIN_AGENTS, MARKER, build_cmd, check_author, clean_log, detect_test_cmd, failed_checks,
                        feedback_since, final_answer, load_agents, parse_ref, readable, with_model)
 
@@ -20,6 +21,24 @@ def test_failed_checks_dedupes_and_finds_job():
 def test_clean_log():
     raw = "pytest\tRun pytest\t2026-11-15T18:50:23.9Z E   assert -1 == 5\npytest\tRun pytest\t2026-11-15T18:50:24.0Z 1 failed"
     assert clean_log(raw) == "E   assert -1 == 5\n1 failed"
+
+
+def test_claim_labeled_removes_label_before_running(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, cwd=None):
+        calls.append(cmd)
+        if "labels=agentflow&" in cmd[-1]:
+            return '[{"number": 5}, {"number": 6, "pull_request": {}}]'
+        if "labels=agentflow-review&" in cmd[-1]:
+            return '[{"number": 7, "pull_request": {}}]'
+        return ""
+
+    monkeypatch.setattr(agentflow, "run", fake_run)
+    assert agentflow.claim_labeled("o/r") == [("o/r#5", False), ("o/r#6", False), ("o/r#7", True)]
+    deletes = [c[-1] for c in calls if "DELETE" in c]
+    assert deletes == ["repos/o/r/issues/5/labels/agentflow", "repos/o/r/issues/6/labels/agentflow",
+                       "repos/o/r/issues/7/labels/agentflow-review"]
 
 
 def test_final_answer():

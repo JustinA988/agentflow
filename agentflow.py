@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
@@ -298,16 +299,93 @@ def resolve(ref, agent, test_cmd=None, log=lambda kind, text: print(text), trust
     return url
 
 
-def main():
-    if sys.argv[1:2] == ["ui"]:
-        import agentflow_ui
-        return agentflow_ui.serve()
-    agents = load_agents()
-    p = argparse.ArgumentParser(prog="agentflow", epilog="Run 'agentflow ui' for the local web UI.")
-    p.add_argument("ref", help="owner/repo#number: an issue (opens a PR) or a PR (addresses new review comments)")
+# Labels are the watch-mode trigger: only people with triage/write access can add them, so a label is a vetted request.
+LABELS = {"agentflow": ("5319e7", "agentflow: issue -> PR, PR -> fix comments and CI", False),
+          "agentflow-review": ("1d76db", "agentflow: post a code review on this PR", True)}
+
+
+def claim_labeled(repo):
+    """Open issues/PRs carrying an agentflow label, as (ref, review). Removes the label so each request runs once."""
+    jobs = []
+    for label, (_, _, review) in LABELS.items():
+        for item in json.loads(run(["gh", "api", f"repos/{repo}/issues?labels={label}&state=open&per_page=100"])):
+            run(["gh", "api", "-X", "DELETE", f"repos/{repo}/issues/{item['number']}/labels/{label}"])
+            jobs.append((f"{repo}#{item['number']}", review))
+    return jobs
+
+
+def report_failure(ref, error):
+    """Tell the requester on the issue/PR why a watched run failed; they can re-add the label to retry."""
+    repo, num = parse_ref(ref)
+    detail = getattr(error, "stderr", None) or str(error)
+    subprocess.run(["gh", "api", f"repos/{repo}/issues/{num}/comments", "-f",
+                    f"body={MARKER}\nagentflow run failed: {detail[-LOG_LIMIT:]}\n\nRe-add the label to retry."],
+                   capture_output=True)
+
+
+def watch(repos, launch, interval=60, log=print):
+    """Poll repos forever; call launch(ref, review) for every newly labeled issue/PR."""
+    for repo in repos:
+        parse_ref(f"{repo}#1")
+        for label, (color, desc, _) in LABELS.items():  # make sure the labels exist so people can apply them
+            run(["gh", "label", "create", label, "-R", repo, "--force", "--color", color, "--description", desc])
+    log(f"Watching {', '.join(repos)} every {interval}s for labels: {', '.join(LABELS)}  (Ctrl+C to stop)")
+    while True:
+        for repo in repos:
+            try:
+                jobs = claim_labeled(repo)
+            except subprocess.CalledProcessError as e:  # network blip or lost access: report and keep watching
+                log(f"{repo}: {(e.stderr or str(e)).strip()}")
+                continue
+            for ref, review in jobs:
+                launch(ref, review)
+        time.sleep(interval)
+
+
+def add_run_options(p, agents):
     p.add_argument("--agent", choices=agents, default="claude")
-    p.add_argument("--test", help="test command to run before pushing (default: auto-detect)")
     p.add_argument("--model", help="model for agents that take one, e.g. --agent ollama --model qwen3.5:9b")
+    p.add_argument("--test", help="test command to run before pushing (default: auto-detect)")
+
+
+def main():
+    agents = load_agents()
+    if sys.argv[1:2] in (["ui"], ["watch"]):
+        cmd = sys.argv[1]
+        p = argparse.ArgumentParser(prog=f"agentflow {cmd}")
+        p.add_argument("repos", nargs="*" if cmd == "ui" else "+", metavar="owner/repo",
+                       help="repos to watch for agentflow labels" + (" (optional)" if cmd == "ui" else ""))
+        add_run_options(p, agents)
+        p.add_argument("--interval", type=int, default=60, help="seconds between checks (default 60)")
+        a = p.parse_args(sys.argv[2:])
+        try:
+            agent = with_model(agents[a.agent], a.model)
+        except ValueError as e:
+            sys.exit(f"error: {e}")
+        if cmd == "ui":
+            import agentflow_ui
+            return agentflow_ui.serve(watch_repos=a.repos, agent_name=a.agent, model=a.model, test_cmd=a.test,
+                                      interval=a.interval)
+
+        def launch(ref, review):  # one at a time, so runs never race on the same repo
+            print(f"\n== {ref} ({'review' if review else 'run'})")
+            try:
+                resolve(ref, agent, a.test, trust=True, review=review)
+            except Exception as e:  # one bad run must not stop the watcher
+                print(f"error: {e}")
+                report_failure(ref, e)
+
+        try:
+            watch(a.repos, launch, a.interval)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    p = argparse.ArgumentParser(prog="agentflow",
+                                epilog="Also: 'agentflow ui [owner/repo ...]' for the web UI, "
+                                       "'agentflow watch owner/repo ...' to act on labeled issues/PRs.")
+    p.add_argument("ref", help="owner/repo#number: an issue (opens a PR) or a PR (addresses new review comments)")
+    add_run_options(p, agents)
     p.add_argument("--trust-author", action="store_true", help="run on an issue from a non-collaborator (read it first)")
     p.add_argument("--review", action="store_true", help="post a code review on the PR instead of changing it")
     a = p.parse_args()

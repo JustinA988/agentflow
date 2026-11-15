@@ -41,6 +41,25 @@ The agent reads the diff and surrounding code in a throwaway checkout and posts 
 suggestions). Nothing is pushed. Run `agentflow owner/repo#45` afterwards and the review counts as feedback, so
 the agent fixes what it found. In the web UI, tick **Review only**.
 
+## Watch mode: label it and walk away
+
+```bash
+agentflow watch owner/repo [owner/repo ...] [--agent ollama --model qwen3.5:9b] [--interval 60]
+agentflow ui owner/repo            # same, with runs showing up in the web UI
+```
+
+agentflow creates two labels in each watched repo and checks every `--interval` seconds:
+
+| Label | On an issue | On a PR |
+|---|---|---|
+| `agentflow` | opens a PR | fixes new review comments and failing CI |
+| `agentflow-review` | (ignored) | posts a code review |
+
+The label is removed when a run starts, so each request runs once; re-add it to run again. If a run fails,
+agentflow comments the error on the issue/PR. Only people with triage or write access can add labels, so a
+labeled issue runs even if a stranger wrote it: adding the label is your OK. It runs on your machine using your
+logins, so it only works while your computer is on.
+
 ## Web UI
 
 ```bash
