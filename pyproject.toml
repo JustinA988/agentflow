@@ -2,7 +2,7 @@
 name = "agentflow"
 version = "0.1.0"
 description = "Turn GitHub issues into PRs with the AI CLI you already pay for. No API keys."
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [project.scripts]
 agentflow = "agentflow:main"
