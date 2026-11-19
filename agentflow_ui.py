@@ -23,6 +23,9 @@ from agentflow import (DIFF_LIMIT, LOG_LIMIT, TEXT, agent_env, build_cmd, detect
 PORT = 8765
 HOME = Path.home() / ".agentflow"
 CHATS, MCP_FILE, MCP_ACTIVE, WORK = HOME / "chats.json", HOME / "mcp.json", HOME / "mcp-active.json", HOME / "work"
+SCRATCH = Path.home() / "agentflow-projects"  # where "start from scratch" projects go
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's empty tree: a brand-new repo can diff before its first commit
+MAX_TEAM = 4
 ALLOWED_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}"}
 HISTORY_CHARS = 12000  # earlier turns replayed to agents that can't resume a session
 STEPS_KEPT = 400
@@ -120,12 +123,37 @@ def git_head(d):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def new_chat(kind, target, agent, model, agents):
-    if agent not in agents:
-        raise ValueError(f"unknown agent {agent!r}")
-    with_model(agents[agent], model or None)
+def check_team(team, agents):
+    """[{name, model, role}]: 1 to MAX_TEAM different agents, each with a model it accepts."""
+    if not isinstance(team, list) or not 1 <= len(team) <= MAX_TEAM:
+        raise ValueError(f"pick 1 to {MAX_TEAM} agents")
+    out = []
+    for m in team:
+        name = m.get("name") if isinstance(m, dict) else None
+        if name not in agents:
+            raise ValueError(f"unknown agent {name!r}")
+        model, role = str(m.get("model") or "").strip(), str(m.get("role") or "").strip()[:200]
+        with_model(agents[name], model or None)
+        out.append({"name": name, "model": model, "role": role})
+    if len({m["name"] for m in out}) < len(out):
+        raise ValueError("each agent can only be on the team once")
+    return out
+
+
+def team_of(chat):  # chats saved before teams existed have a single agent/model
+    return chat.get("team") or [{"name": chat["agent"], "model": chat.get("model", ""), "role": ""}]
+
+
+def new_chat(kind, target, team, agents, name=""):
+    team = check_team(team, agents)
     cid = uuid.uuid4().hex[:10]
-    if kind == "github":
+    if kind == "new":  # no project picked: start from scratch in a fresh folder named after the first message
+        slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower())[:40].strip("-") or "project"
+        p = SCRATCH / f"{slug}-{cid[:4]}"
+        p.mkdir(parents=True)
+        run(["git", "init", "-q"], p)
+        kind, target, d, base = "local", str(p), str(p), EMPTY_TREE
+    elif kind == "github":
         parse_ref(f"{target}#1")  # validates owner/repo before it ever reaches gh
         d, base = str(WORK / cid), None  # cloned on the first message
     elif kind == "local":
@@ -138,7 +166,7 @@ def new_chat(kind, target, agent, model, agents):
         raise ValueError("pick a GitHub repo or a folder first")
     now = time.time()
     chat = {"id": cid, "title": "New chat", "kind": kind, "target": target, "dir": d, "base": base, "branch": None,
-            "agent": agent, "model": model or "", "session": None, "session_agent": None, "pr": None,
+            "team": team, "agent": team[0]["name"], "sessions": {}, "pr": None,
             "status": "idle", "diff": "", "created": now, "updated": now, "messages": []}
     with lock:
         chats[cid] = chat
@@ -146,45 +174,56 @@ def new_chat(kind, target, agent, model, agents):
     return chat
 
 
-def set_agent(cid, agent, model, agents):
-    if agent not in agents:
-        raise ValueError(f"unknown agent {agent!r}")
-    with_model(agents[agent], model or None)
+def set_team(cid, team, agents):
+    team = check_team(team, agents)
     with lock:
         chat = get(cid)
-        chat["agent"], chat["model"] = agent, model or ""
+        chat["team"], chat["agent"] = team, team[0]["name"]
     save_chats()
     return chat
 
 
 def with_history(messages, text):
     """Agents that can't resume a session get the conversation so far (newest kept) with each message."""
-    past = "\n\n".join(f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['text']}"
+    past = "\n\n".join(f"{'User' if m['role'] == 'user' else m.get('agent') or 'Assistant'}: {m['text']}"
                        for m in messages if m.get("text"))[-HISTORY_CHARS:]
     return f"Conversation so far:\n{past}\n\nNew message from the user:\n{text}" if past else text
 
 
-def start(chat, job, notify=None):
-    """Add a running agent message to chat and run job(msg) in the background."""
-    msg = {"role": "agent", "agent": chat["agent"], "text": "", "steps": [], "status": "running"}
+def new_msg(chat, agent, label=""):
+    msg = {"role": "agent", "agent": agent, "label": label, "text": "", "steps": [], "status": "running"}
     with lock:
         chat["messages"].append(msg)
-        chat["status"], chat["updated"] = "running", time.time()
+        chat["updated"] = time.time()
+    return msg
+
+
+def run_part(msg, fn):
+    """Run fn and record how it ended on msg. Returns the exception, if any."""
+    try:
+        fn()
+        if msg["status"] == "running":
+            msg["status"] = "done"
+    except Exception as e:  # every failure lands in the chat instead of a dead thread
+        msg["status"] = "error"
+        if isinstance(e, FileNotFoundError):
+            msg["error"] = f"couldn't start {msg['agent']}: is it installed? Settings shows how to install it."
+        elif isinstance(e, subprocess.CalledProcessError):
+            msg["error"] = f"{' '.join(map(str, e.cmd[:3]))} failed: {(e.stderr or '').strip() or e}"
+        else:
+            msg["error"] = str(e)
+        return e
+
+
+def start(chat, job, notify=None):
+    """Add a running message from the lead agent and run job(msg) in the background."""
+    msg = new_msg(chat, team_of(chat)[0]["name"])
+    with lock:
+        chat["status"] = "running"
 
     def work():
         try:
-            job(msg)
-            if msg["status"] == "running":
-                msg["status"] = "done"
-        except Exception as e:  # every failure lands in the chat instead of a dead thread
-            msg["status"] = "error"
-            if isinstance(e, FileNotFoundError):
-                msg["error"] = f"couldn't start {chat['agent']}: is it installed? Settings shows how to install it."
-            elif isinstance(e, subprocess.CalledProcessError):
-                msg["error"] = f"{' '.join(map(str, e.cmd[:3]))} failed: {(e.stderr or '').strip() or e}"
-            else:
-                msg["error"] = str(e)
-            if notify:
+            if (e := run_part(msg, lambda: job(msg))) and notify:
                 report_failure(notify, e)
         finally:
             with lock:
@@ -213,7 +252,11 @@ def send(cid, text, agents, notify=None):
             chat["title"] = f"{m.group(1).title()} #{m.group(2)}" if m else text.splitlines()[0][:60]
     if m:
         return start(chat, lambda msg: slash_turn(chat, msg, m, agents), notify)
-    return start(chat, lambda msg: agent_turn(chat, msg, text, past, agents))
+    if len(team_of(chat)) > 1:
+        return start(chat, lambda msg: team_turn(chat, msg, text, past, agents))
+    role = team_of(chat)[0]["role"]
+    prompt = f"(Your role in this project: {role}.)\n\n{text}" if role else text
+    return start(chat, lambda msg: agent_turn(chat, msg, prompt, past, agents))
 
 
 def step(msg, text):
@@ -235,21 +278,23 @@ def prepare(chat, msg):
     return chat["dir"]
 
 
-def agent_turn(chat, msg, text, past, agents):
-    agent = with_model(agents[chat["agent"]], chat["model"] or None)
+def agent_turn(chat, msg, text, past, agents, member=None, track=True):
+    member = member or team_of(chat)[0]
+    agent = with_model(agents[member["name"]], member["model"] or None)
     d = prepare(chat, msg)
-    session = chat["session"] if chat["session_agent"] == chat["agent"] and agent.get("resume") else None
+    sessions = chat.setdefault("sessions", {})  # one per agent, so teammates never resume each other's session
+    session = sessions.get(member["name"]) if agent.get("resume") else None
     mcp = active_mcp(load_mcp())
     cmd = safe_cmd(build_cmd(agent, text if session else with_history(past, text), session, mcp))
     p = subprocess.Popen(cmd, cwd=d, env=agent_env(agent, mcp), stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **TEXT)
     with lock:
-        procs[chat["id"]] = p
+        procs.setdefault(chat["id"], []).append(p)
     lines = []
     for line in p.stdout:
         lines.append(line.rstrip("\n"))
         if sid := session_of(lines[-1]):
-            chat["session"], chat["session_agent"] = sid, chat["agent"]
+            sessions[member["name"]] = sid
         if t := readable(lines[-1]):
             step(msg, t)
     code = p.wait()
@@ -257,17 +302,69 @@ def agent_turn(chat, msg, text, past, agents):
     if msg.get("stopped"):
         msg["status"] = "stopped"
     elif code:
-        if session:
-            chat["session"] = None  # a stale session is a common cause; next message starts fresh with the history
-        msg["status"], msg["error"] = "error", f"{chat['agent']} exited with code {code}" + (
+        if session:  # a stale session is a common cause; next message starts fresh with the history
+            sessions.pop(member["name"], None)
+        msg["status"], msg["error"] = "error", f"{member['name']} exited with code {code}" + (
             "" if msg["text"] else ". Is it installed and signed in?")
-    update_changes(chat, msg)
+    if track:
+        update_changes(chat, msg)
+
+
+PLAN_PROMPT = """You are {me} on a team of AI coding agents sharing one project folder: {team}.
+The user asked: {text}
+
+{task}
+Don't edit any files yet. Reply with only the plan."""
+FIRST_PLAN = ("Before anyone edits files, write a short plan that splits this work between the team. Give each agent "
+              "its tasks and the files it owns, so no two agents edit the same file. Follow any roles the user gave.")
+REVIEW_PLAN = ("Your teammates drafted this plan:\n\n{plan}\n\nCheck it from your side: is your part clear and doable, "
+               "and is anything missing or overlapping? Reply with the final plan, changed where needed.")
+WORK_PROMPT = """You are {me} on a team of AI coding agents ({team}) working at the same time in this project folder.
+The user asked: {text}
+
+The team's agreed plan:
+{plan}
+
+Do only your part of the plan, and don't edit files the plan gives to another agent. When you're done, reply with a
+short summary of what you did."""
+
+
+def team_turn(chat, msg, text, past, agents):
+    """The team agrees on a plan in turn (the lead drafts, each teammate revises it), then all build their part at once.
+    Agents coordinate only through the plan, which gives each one its own files so they don't overwrite each other."""
+    team = team_of(chat)
+    names = ", ".join(m["name"] + (f" ({m['role']})" if m["role"] else "") for m in team)
+    me = lambda m: m["name"] + (f", in charge of {m['role']}" if m["role"] else "")
+    plan = ""
+    for i, member in enumerate(team):
+        m = msg if i == 0 else new_msg(chat, member["name"])
+        m["label"] = "plan review" if plan else "plan"
+        task = REVIEW_PLAN.format(plan=plan) if plan else FIRST_PLAN
+        prompt = PLAN_PROMPT.format(me=me(member), team=names, text=text, task=task)
+        run_part(m, lambda: agent_turn(chat, m, prompt, past, agents, member, track=False))
+        if m["status"] != "done":
+            return  # stopped or failed: nobody builds on half a plan
+        plan = m["text"] or plan
+    if not plan:
+        raise RuntimeError("the team didn't produce a plan")
+    workers = []
+    for member in team:
+        wm = new_msg(chat, member["name"], member["role"] or "build")
+        prompt = WORK_PROMPT.format(me=me(member), team=names, text=text, plan=plan)
+        job = lambda wm=wm, member=member, prompt=prompt: agent_turn(chat, wm, prompt, past, agents, member, track=False)
+        workers.append(threading.Thread(target=run_part, args=(wm, job), daemon=True))
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    update_changes(chat, wm)
 
 
 def slash_turn(chat, msg, m, agents):
     """/issue N, /fix N, /review N: the classic one-shot automations, logged into this chat."""
     kind, num, trust = m.group(1), m.group(2), bool(m.group(3))
-    agent = with_model(agents[chat["agent"]], chat["model"] or None)
+    lead = team_of(chat)[0]
+    agent = with_model(agents[lead["name"]], lead["model"] or None)
     names = {"tests": lambda t: t.splitlines()[0], "diff": lambda t: "Changes staged", "pr": lambda t: f"PR: {t}"}
     try:
         url = resolve(f"{chat['target']}#{num}", agent, None, lambda k, t: step(msg, names.get(k, str)(t)),
@@ -335,10 +432,11 @@ def make_pr(cid):
 def stop(cid):
     with lock:
         chat = get(cid)
-        p = procs.get(cid)
-        if chat["messages"] and chat["messages"][-1].get("status") == "running":
-            chat["messages"][-1]["stopped"] = True
-    if p:
+        running = list(procs.get(cid, []))
+        for m in chat["messages"]:
+            if m.get("status") == "running":
+                m["stopped"] = True
+    for p in running:
         if os.name == "nt":  # kill the agent's whole process tree, not just the launcher
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
         else:
@@ -431,10 +529,11 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self.send(400, {"error": "bad JSON"})
         routes = {
-            "/api/chats": lambda: new_chat(b.get("kind"), (b.get("target") or "").strip(), b.get("agent", "claude"),
-                                           (b.get("model") or "").strip(), self.agents),
+            "/api/chats": lambda: new_chat(b.get("kind"), (b.get("target") or "").strip(),
+                                           b["team"] if "team" in b else [{"name": b.get("agent", "claude"), "model": b.get("model")}],
+                                           self.agents, b.get("name", "")),
             "/api/send": lambda: send(b.get("id"), b.get("text"), self.agents),
-            "/api/agent": lambda: set_agent(b.get("id"), b.get("agent"), (b.get("model") or "").strip(), self.agents),
+            "/api/team": lambda: set_team(b.get("id"), b.get("team"), self.agents),
             "/api/stop": lambda: stop(b.get("id")),
             "/api/pr": lambda: make_pr(b.get("id")),
             "/api/delete": lambda: delete(b.get("id")),
@@ -487,7 +586,7 @@ def serve(port=PORT, watch_repos=(), agent_name="claude", model=None, test_cmd=N
     if watch_repos:
         def launch(ref, review):  # each labeled issue/PR becomes its own chat
             repo, num = parse_ref(ref)
-            chat = new_chat("github", repo, agent_name, model or "", Handler.agents)
+            chat = new_chat("github", repo, [{"name": agent_name, "model": model or ""}], Handler.agents)
             send(chat["id"], f"/{'review' if review else 'issue'} {num} --trust", Handler.agents, notify=ref)
         threading.Thread(target=watch, args=(watch_repos, launch, interval), daemon=True).start()
     if app:
@@ -611,7 +710,7 @@ main.empty #composerWrap{flex:1}
 #welcome p{color:var(--muted);margin:0}
 .suggest{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:800px;margin:0 auto 14px}
 
-.pop{position:fixed;z-index:20;width:340px;max-width:calc(100% - 16px);background:rgba(28,28,30,.88);-webkit-backdrop-filter:blur(40px) saturate(180%);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--line2);border-radius:16px;box-shadow:0 24px 70px rgba(0,0,0,.65);padding:8px;display:none}
+.pop{position:fixed;z-index:20;width:360px;max-height:calc(100% - 24px);overflow-y:auto;max-width:calc(100% - 16px);background:rgba(28,28,30,.88);-webkit-backdrop-filter:blur(40px) saturate(180%);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--line2);border-radius:16px;box-shadow:0 24px 70px rgba(0,0,0,.65);padding:8px;display:none}
 .pop.open{display:block;animation:pop .14s ease-out}
 .seg{display:flex;background:rgba(118,118,128,.18);border-radius:10px;padding:2px;margin:2px 2px 8px}
 .seg button{flex:1;height:28px;border-radius:8px;font-size:13px;color:var(--muted);font-weight:500}
@@ -628,6 +727,9 @@ main.empty #composerWrap{flex:1}
 .opt svg{width:15px;height:15px;color:var(--muted)}
 .pop-label{font-size:11.5px;color:var(--faint);font-weight:600;padding:8px 10px 4px}
 .pop .btn{width:100%;justify-content:center;height:36px;border-radius:10px}
+.member{display:flex;gap:6px;padding:0 8px 8px 35px}.member .field{height:30px;font-size:13px;padding:0 10px}
+.pop-note{font-size:12px;color:var(--faint);padding:8px 10px 4px;line-height:1.45}
+.lbl{color:var(--muted);background:var(--elev);border:1px solid var(--line);border-radius:6px;padding:0 7px;font-size:11.5px}
 
 #drawer{position:fixed;top:0;right:0;bottom:0;width:min(760px,100%);background:var(--panel);border-left:1px solid var(--line2);transform:translateX(100%);transition:transform .28s cubic-bezier(.2,.8,.2,1);z-index:15;display:flex;flex-direction:column}
 #drawer.open{transform:none;box-shadow:-30px 0 90px rgba(0,0,0,.7)}
@@ -696,7 +798,7 @@ dialog::backdrop{background:rgba(0,0,0,.6);-webkit-backdrop-filter:blur(8px);bac
     <button class="btn primary" id="prBtn" hidden></button>
   </header>
   <section id="thread"><div class="col" id="msgs"></div></section>
-  <div id="welcome"><h1>What should we build?</h1><p>Pick a GitHub repo or a folder on your PC, choose an agent, and start typing.</p></div>
+  <div id="welcome"><h1>What should we build?</h1><p>Start a new project, or pick a GitHub repo or a folder. Choose one agent, or a few to work as a team.</p></div>
   <div id="composerWrap">
     <div class="suggest" id="suggest"></div>
     <form id="composer">
@@ -737,6 +839,8 @@ const I = {
   trash:'<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>',
   file:'<svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',
   pr:'<svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M6 8.5v7M18 15.5V9a3 3 0 0 0-3-3h-4m2-2-2 2 2 2"/></svg>',
+  plus:'<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+  check:'<svg viewBox="0 0 24 24" style="color:var(--accent)"><path d="m5 12 5 5 9-10"/></svg>',
   logo:'<span class="logo"><svg viewBox="0 0 24 24"><path d="M6 17l6-10 6 10"/></svg></span>'
 };
 const ABOUT = {claude:'Claude Code · your Claude plan', codex:'OpenAI Codex · your ChatGPT plan', ollama:'Local models through Ollama · free, offline',
@@ -750,8 +854,10 @@ const SUGGEST = ['Explain how this project is organized', 'Find a bug and fix it
 const ls = (k, v) => { try { if (v === undefined) return localStorage.getItem('af.' + k); localStorage.setItem('af.' + k, v); } catch (e) { return null; } };
 let S = {chats: [], agents: [], mcp: {}, watching: []}, cur = null, sig = '', repos = null, projTab = 'github', setTab = 'agents', stick = true;
 const openSteps = new Set();
-let pending = {project: null, agent: ls('agent') || 'claude', model: ls('model') || ''};
-try { pending.project = JSON.parse(ls('project') || 'null'); } catch (e) {}
+let pending = {project: null, team: null};
+try { pending.project = JSON.parse(ls('project') || 'null'); pending.team = JSON.parse(ls('team') || 'null'); } catch (e) {}
+pending.team = pending.team || [{name: ls('agent') || 'claude', model: ls('model') || '', role: ''}];
+const teamOf = () => cur ? (cur.team || [{name: cur.agent, model: cur.model || '', role: ''}]) : pending.team;
 
 async function api(path, body) {
   const r = await fetch(path, body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
@@ -815,9 +921,8 @@ function renderComposer() {
   const running = !!cur && cur.status === 'running';
   const proj = cur ? {kind: cur.kind, target: cur.target} : pending.project;
   $('#projBtn').hidden = !!cur;
-  $('#projBtn').innerHTML = proj ? projLabel(proj.kind, proj.target) : I.folder + '<span>Choose project</span>';
-  const agent = cur ? cur.agent : pending.agent, model = cur ? cur.model : pending.model;
-  $('#agentBtn').innerHTML = I.spark + `<span>${esc(agent)}${model ? ' · ' + esc(model) : ''}</span>`;
+  $('#projBtn').innerHTML = proj ? projLabel(proj.kind, proj.target) : I.plus + '<span>New project</span>';
+  $('#agentBtn').innerHTML = I.spark + `<span>${teamOf().map(m => esc(m.name) + (m.role ? ' · ' + esc(m.role) : m.model ? ' · ' + esc(m.model) : '')).join(' + ')}</span>`;
   const send = $('#send');
   send.innerHTML = running ? I.stop : I.up;
   send.setAttribute('aria-label', running ? 'Stop' : 'Send');
@@ -830,7 +935,7 @@ function renderComposer() {
 function msgHtml(m, i) {
   if (m.role === 'user') return `<div class="msg user"><div class="bubble">${esc(m.text)}</div></div>`;
   const steps = m.steps || [], tools = steps.filter(s => s.startsWith('→')).length;
-  let h = `<div class="msg"><div class="who">${m.agent === 'agentflow' ? I.logo : I.spark}${esc(m.agent)}</div>`;
+  let h = `<div class="msg"><div class="who">${m.agent === 'agentflow' ? I.logo : I.spark}${esc(m.agent)}${m.label ? `<span class="lbl">${esc(m.label)}</span>` : ''}</div>`;
   if (m.status === 'running') {
     h += `<div class="working">${m.stopped ? 'Stopping…' : steps.length ? 'Working…' : 'Thinking…'}</div>`;
     if (steps.length) h += `<div class="log live">${esc(steps.slice(-16).join('\n'))}</div>`;
@@ -901,8 +1006,7 @@ $('#composer').addEventListener('submit', async e => {
   if (!text) return;
   try {
     if (!cur) {
-      if (!pending.project) { openPop('proj'); return toast('First choose a GitHub repo or a folder on your PC.'); }
-      cur = await api('/api/chats', {...pending.project, agent: pending.agent, model: pending.model});
+      cur = await api('/api/chats', pending.project ? {...pending.project, team: pending.team} : {kind: 'new', name: text, team: pending.team});
       ls('chat', cur.id);
     }
     input.value = ''; grow();
@@ -933,7 +1037,8 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') { closePops(
 function chooseProject(p) { pending.project = p; ls('project', JSON.stringify(p)); closePops(); renderComposer(); input.focus(); }
 function fillProj() {
   const seen = new Set(), recent = S.chats.filter(c => !seen.has(c.kind + c.target) && seen.add(c.kind + c.target)).slice(0, 4);
-  let h = `<div class="seg"><button data-tab="github" class="${projTab === 'github' ? 'on' : ''}">GitHub repo</button><button data-tab="folder" class="${projTab === 'folder' ? 'on' : ''}">Folder on this PC</button></div>`;
+  let h = `<button class="opt${pending.project ? '' : ' on'}" data-new>${I.plus}<span>New project · start from scratch</span>${pending.project ? '' : '<small>✓</small>'}</button>
+    <div class="seg" style="margin-top:6px"><button data-tab="github" class="${projTab === 'github' ? 'on' : ''}">GitHub repo</button><button data-tab="folder" class="${projTab === 'folder' ? 'on' : ''}">Folder on this PC</button></div>`;
   if (projTab === 'github') {
     h += `<input class="field" id="repoQ" placeholder="Search your repos, or type owner/repo" autocomplete="off"><div class="list" id="repoList"></div>`;
   } else {
@@ -966,6 +1071,7 @@ $('#projPop').addEventListener('click', async e => {
   const t = e.target.closest('button'); if (!t) return;
   if (t.dataset.tab) { projTab = t.dataset.tab; return fillProj(); }
   if (t.dataset.kind) return chooseProject({kind: t.dataset.kind, target: t.dataset.target});
+  if ('new' in t.dataset) return chooseProject(null);
   if (t.id === 'pathGo') { const p = $('#pathIn').value.trim(); if (p) chooseProject({kind: 'local', target: p}); }
   if (t.id === 'browseBtn') {
     t.disabled = true; t.textContent = 'Waiting for the folder picker…';
@@ -976,28 +1082,47 @@ $('#projPop').addEventListener('click', async e => {
 });
 
 function fillAgent() {
-  const a = cur ? cur.agent : pending.agent, model = cur ? cur.model : pending.model, info = agentInfo(a);
-  $('#agentPop').innerHTML = '<div class="pop-label">Agent</div>' + S.agents.map(x =>
-    `<button class="opt${x.name === a ? ' on' : ''}${x.installed ? '' : ' off'}" data-agent="${x.name}">${I.spark}<span>${esc(x.name)}</span><small>${x.name === a ? '✓' : x.installed ? '' : 'not installed'}</small></button>`).join('') +
-    `<div class="pop-label">Model</div><div style="padding:0 2px 4px"><input class="field" id="modelIn" value="${esc(model)}" ${info.takes_model ? '' : 'disabled'}
-      placeholder="${info.needs_model ? 'Required, e.g. qwen3.5:9b' : info.takes_model ? 'Default (press Enter to set)' : 'Set by the agent itself'}"></div>`;
+  const team = teamOf();
+  let h = '<div class="pop-label">Agents · pick one, or several to work as a team</div>';
+  for (const x of S.agents) {
+    const i = team.findIndex(m => m.name === x.name), m = team[i];
+    const tag = m ? (team.length > 1 ? (i === 0 ? 'lead' : '') : '') : x.installed ? '' : 'not installed';
+    h += `<button class="opt${m ? ' on' : ''}${x.installed ? '' : ' off'}" data-agent="${x.name}" aria-pressed="${!!m}">${m ? I.check : I.spark}<span>${esc(x.name)}</span><small>${tag}</small></button>`;
+    if (m) h += `<div class="member"><input class="field" data-field="role" data-name="${x.name}" value="${esc(m.role)}" placeholder="Role (optional), e.g. design" aria-label="${x.name} role">` +
+      (x.takes_model ? `<input class="field" data-field="model" data-name="${x.name}" value="${esc(m.model)}" placeholder="${x.needs_model ? 'Model (required)' : 'Model'}" aria-label="${x.name} model" style="width:120px;flex:none">` : '') + '</div>';
+  }
+  h += team.length > 1 ? '<div class="pop-note">They plan together first and split the work (each gets its own files), then build their parts at the same time.</div>'
+    : '<div class="pop-note">Pick a second agent to make a team.</div>';
+  $('#agentPop').innerHTML = h;
 }
-async function setAgent(agent, model) {
-  if (!agentInfo(agent).takes_model) model = '';
+async function saveTeam(team) {
   try {
-    if (cur) cur = await api('/api/agent', {id: cur.id, agent, model});
-    else { pending.agent = agent; pending.model = model; ls('agent', agent); ls('model', model); }
-  } catch (e) { toast(e.message); }
+    if (cur) cur = await api('/api/team', {id: cur.id, team});
+    else { pending.team = team; ls('team', JSON.stringify(team)); }
+  } catch (e) {
+    toast(e.message);
+    if (cur) cur.team = team;  // keep it on screen so a missing model can still be typed in
+  }
   renderComposer(); fillAgent();
 }
 $('#agentPop').addEventListener('click', e => {
   const b = e.target.closest('[data-agent]'); if (!b) return;
-  const info = agentInfo(b.dataset.agent);
-  if (!info.installed) toast(`${b.dataset.agent} isn't installed yet. Settings → Agents shows how.`);
-  setAgent(b.dataset.agent, info.needs_model ? ($('#modelIn').value.trim() || '') : '');
+  const name = b.dataset.agent, team = teamOf().map(m => ({...m})), i = team.findIndex(m => m.name === name);
+  if (i >= 0) { if (team.length === 1) return toast('Keep at least one agent.'); team.splice(i, 1); }
+  else {
+    if (team.length >= 4) return toast('Up to 4 agents at a time.');
+    if (!agentInfo(name).installed) toast(`${name} isn't installed yet. Settings → Agents shows how.`);
+    team.push({name, model: '', role: ''});
+  }
+  saveTeam(team);
 });
-$('#agentPop').addEventListener('change', e => { if (e.target.id === 'modelIn') setAgent(cur ? cur.agent : pending.agent, e.target.value.trim()); });
-$('#agentPop').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'modelIn') { e.target.blur(); closePops(); } });
+$('#agentPop').addEventListener('change', e => {
+  const f = e.target.dataset.field; if (!f) return;
+  const team = teamOf().map(m => ({...m}));
+  team.find(m => m.name === e.target.dataset.name)[f] = e.target.value.trim();
+  saveTeam(team);
+});
+$('#agentPop').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.dataset.field) e.target.blur(); });
 
 // ---------- chat list, header, drawer ----------
 $('#chatList').addEventListener('click', async e => {

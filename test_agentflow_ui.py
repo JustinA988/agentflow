@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -12,11 +13,18 @@ import agentflow_ui as ui
 
 # A stand-in agent: prints a reply and creates a file, like a real agent editing the project.
 FAKE = {"cmd": [sys.executable, "-c", "print('hello from fake'); open('new.txt', 'w').write('x')", "{prompt}"]}
+# A stand-in team member: answers planning prompts with a plan, and builds (writes its own file) once given the plan.
+TEAMY = {"cmd": [sys.executable, "-c", """import os, sys
+p = sys.argv[-1]
+if 'agreed plan' in p:
+    open(f'part-{os.getpid()}.txt', 'w').write('x'); print('built')
+else:
+    print('FINAL PLAN' if 'drafted this plan' in p else 'PLAN: split it')""", "{prompt}"]}
 
 
 @pytest.fixture(autouse=True)
 def home(tmp_path, monkeypatch):
-    for name, file in [("CHATS", "chats.json"), ("MCP_FILE", "mcp.json"), ("MCP_ACTIVE", "mcp-active.json"), ("WORK", "work")]:
+    for name, file in [("CHATS", "chats.json"), ("MCP_FILE", "mcp.json"), ("MCP_ACTIVE", "mcp-active.json"), ("WORK", "work"), ("SCRATCH", "projects")]:
         monkeypatch.setattr(ui, name, tmp_path / "home" / file)
     ui.chats.clear()
     ui.Handler.agents = {"claude": {"cmd": ["claude", "-p", "{prompt}"], "model_args": ["--model", "{model}"]}, "fake": FAKE}
@@ -64,7 +72,10 @@ def test_new_chat_validation(server, tmp_path):
     assert req(server, "POST", "/api/chats", {"kind": "local", "target": str(tmp_path / "missing")})[0] == 400
     assert req(server, "POST", "/api/chats", {"kind": "local", "target": str(tmp_path), "agent": "fake", "model": "x"})[0] == 400
     status, chat = req(server, "POST", "/api/chats", {"kind": "github", "target": "octo/cat", "agent": "claude", "model": "sonnet"})
-    assert status == 200 and chat["dir"].endswith(chat["id"]) and chat["model"] == "sonnet"
+    assert status == 200 and chat["dir"].endswith(chat["id"]) and chat["team"][0]["model"] == "sonnet"
+    team = lambda *names: {"kind": "new", "name": "x", "team": [{"name": n} for n in names]}
+    for bad in (team(), team("fake", "fake"), team("ghost"), team(*["fake"] * 5)):
+        assert req(server, "POST", "/api/chats", bad)[0] == 400
 
 
 def test_chat_turn_runs_agent_and_tracks_changes(server, tmp_path):
@@ -113,3 +124,25 @@ def test_mcp_parse_and_edit(server):
     req(server, "POST", "/api/mcp", {"action": "delete", "name": "a"})
     assert ui.active_mcp(ui.load_mcp()) is None
     assert req(server, "POST", "/api/mcp", {"action": "delete", "name": "zzz"})[0] == 400
+
+
+def wait_idle(port, cid):
+    for _ in range(150):
+        _, chat = req(port, "GET", f"/api/chat?id={cid}")
+        if chat["status"] == "idle":
+            return chat
+        time.sleep(0.1)
+    raise AssertionError("chat never finished")
+
+
+def test_team_plans_then_builds_at_once_in_a_new_project(server):
+    ui.Handler.agents.update(a=TEAMY, b=TEAMY)
+    body = {"kind": "new", "name": "Todo App!", "team": [{"name": "a", "role": "design"}, {"name": "b", "role": "coding"}]}
+    _, chat = req(server, "POST", "/api/chats", body)
+    folder = Path(chat["dir"])
+    assert folder.parent == ui.SCRATCH and folder.name.startswith("todo-app-") and (folder / ".git").is_dir()
+    req(server, "POST", "/api/send", {"id": chat["id"], "text": "build it"})
+    msgs = wait_idle(server, chat["id"])["messages"][1:]
+    assert [(m["agent"], m["label"], m["text"]) for m in msgs[:2]] == [("a", "plan", "PLAN: split it"), ("b", "plan review", "FINAL PLAN")]
+    assert sorted((m["agent"], m["label"], m["text"]) for m in msgs[2:]) == [("a", "design", "built"), ("b", "coding", "built")]
+    assert all(m["status"] == "done" for m in msgs) and msgs[-1]["files"] == 2  # both built, in parallel, in one folder

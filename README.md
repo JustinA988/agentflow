@@ -15,9 +15,14 @@ agentflow app
 
 A dark chat window, like Claude or ChatGPT:
 
-- **Pick a project**: one of your GitHub repos (agentflow works on its own copy, on its own branch) or any folder on
-  your PC (the agent edits those files directly).
+- **Pick a project**: one of your GitHub repos (agentflow works on its own copy, on its own branch), any folder on
+  your PC (the agent edits those files directly), or nothing: it starts a new project from scratch in
+  `~/agentflow-projects/<name>`.
 - **Pick an agent** and, optionally, a model. Switch any time, even mid-chat.
+- **Or pick a team** (up to 4 agents), each with an optional role like "design" or "coding". For each message the
+  team plans first: the lead drafts a plan that gives every agent its tasks and its own files, and each teammate
+  reviews and revises it. Then they all build their parts at the same time in the shared project folder. They
+  coordinate only through the plan, so keep the work splittable by file.
 - **Chat.** The agent reads and edits code and replies; follow-up messages keep the conversation's context.
   You see its steps live, every change as a color-coded diff, and a Stop button.
 - **Create PR** (GitHub chats): commits, runs the tests, pushes and opens the PR (a draft if tests fail).
