@@ -350,11 +350,11 @@ def add_run_options(p, agents):
 
 def main():
     agents = load_agents()
-    if sys.argv[1:2] in (["ui"], ["watch"]):
+    if sys.argv[1:2] in (["ui"], ["app"], ["watch"]):
         cmd = sys.argv[1]
         p = argparse.ArgumentParser(prog=f"agentflow {cmd}")
-        p.add_argument("repos", nargs="*" if cmd == "ui" else "+", metavar="owner/repo",
-                       help="repos to watch for agentflow labels" + (" (optional)" if cmd == "ui" else ""))
+        p.add_argument("repos", nargs="+" if cmd == "watch" else "*", metavar="owner/repo",
+                       help="repos to watch for agentflow labels" + ("" if cmd == "watch" else " (optional)"))
         add_run_options(p, agents)
         p.add_argument("--interval", type=int, default=60, help="seconds between checks (default 60)")
         a = p.parse_args(sys.argv[2:])
@@ -362,10 +362,10 @@ def main():
             agent = with_model(agents[a.agent], a.model)
         except ValueError as e:
             sys.exit(f"error: {e}")
-        if cmd == "ui":
+        if cmd in ("ui", "app"):
             import agentflow_ui
             return agentflow_ui.serve(watch_repos=a.repos, agent_name=a.agent, model=a.model, test_cmd=a.test,
-                                      interval=a.interval)
+                                      interval=a.interval, app=cmd == "app")
 
         def launch(ref, review):  # one at a time, so runs never race on the same repo
             print(f"\n== {ref} ({'review' if review else 'run'})")
@@ -382,7 +382,7 @@ def main():
         return
 
     p = argparse.ArgumentParser(prog="agentflow",
-                                epilog="Also: 'agentflow ui [owner/repo ...]' for the web UI, "
+                                epilog="Also: 'agentflow app' (desktop window) or 'agentflow ui' (web UI) [owner/repo ...], "
                                        "'agentflow watch owner/repo ...' to act on labeled issues/PRs.")
     p.add_argument("ref", help="owner/repo#number: an issue (opens a PR) or a PR (addresses new review comments)")
     add_run_options(p, agents)

@@ -3,6 +3,8 @@
 Binds to 127.0.0.1 only. `agentflow ui` then open http://localhost:8765
 """
 import json
+import os
+import shutil
 import subprocess
 import threading
 import time
@@ -10,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from urllib.parse import parse_qs, urlsplit
+import webbrowser
 
 from agentflow import load_agents, parse_ref, report_failure, resolve, run, watch, with_model
 
@@ -126,16 +129,51 @@ class Handler(BaseHTTPRequestHandler):
         pass  # keep the console quiet; the page shows everything
 
 
-def serve(port=PORT, watch_repos=(), agent_name="claude", model=None, test_cmd=None, interval=60):
+def app_browser():
+    """A Chromium browser that can open a page as its own app window (Edge ships with Windows)."""
+    found = [shutil.which(b) for b in ("msedge", "chrome", "chromium", "google-chrome")]
+    found += [os.path.join(os.environ.get(v, ""), "Microsoft", "Edge", "Application", "msedge.exe")
+              for v in ("ProgramFiles(x86)", "ProgramFiles")]
+    return next((f for f in found if f and os.path.isfile(f)), None)
+
+
+def open_window(url):
+    """Show the UI in its own window and return when the window is closed."""
+    exe = app_browser()
+    if not exe:  # no app-capable browser: use the default one and stop with Ctrl+C
+        webbrowser.open(url)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return
+    # Its own profile makes this a separate browser process that lives exactly as long as the window.
+    subprocess.run([exe, f"--app={url}", f"--user-data-dir={Path.home() / '.agentflow-app'}",
+                    "--no-first-run", "--no-default-browser-check", "--window-size=1280,860"])
+
+
+def serve(port=PORT, watch_repos=(), agent_name="claude", model=None, test_cmd=None, interval=60, app=False):
     Handler.agents = load_agents()
     Handler.watching = list(watch_repos)
     runs.extend(r for r in load_history() if r.get("status") != "running")
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"agentflow UI: http://localhost:{port}  (Ctrl+C to stop)")
+    url = f"http://localhost:{port}"
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:
+        if not app:
+            raise
+        return open_window(url)  # already running: just open another window onto it
+    print(f"agentflow UI: {url}  (Ctrl+C to stop)")
     if watch_repos:
         def launch(ref, review):
             start_run(ref, agent_name, test_cmd, Handler.agents, trust=True, model=model or "", review=review, notify=True)
         threading.Thread(target=watch, args=(watch_repos, launch, interval), daemon=True).start()
+    if app:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        open_window(url)
+        while any(r["status"] == "running" for r in runs):  # closing the window must not kill a run mid-push
+            time.sleep(2)
+        return
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -145,6 +183,7 @@ def serve(port=PORT, watch_repos=(), agent_name="claude", model=None, test_cmd=N
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>agentflow</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Cpath d='M9 22l7-12 7 12' fill='none' stroke='white' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#f7f7f8;--panel:#fff;--text:#1b1b1f;--muted:#666;--border:#ddd;--add:#e6f4ea;--addt:#14532d;--del:#fdecea;--delt:#7f1d1d;--accent:#2563eb;--ok:#15803d;--bad:#b91c1c;--warn:#b45309;--code:#f1f1f3}
 @media (prefers-color-scheme:dark){:root{--bg:#111214;--panel:#1a1b1e;--text:#e8e8ea;--muted:#9a9aa2;--border:#2c2d31;--add:#12321f;--addt:#9ae6b4;--del:#3b1515;--delt:#fca5a5;--accent:#60a5fa;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--code:#141518}}

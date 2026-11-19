@@ -69,6 +69,22 @@ agentflow ui
 Open http://localhost:8765 to start runs and watch progress, agent output, a color-coded diff, test results and
 PR links. Run history is saved to `~/.agentflow-history.json`. The server only listens on 127.0.0.1.
 
+## Desktop app
+
+```bash
+agentflow app [owner/repo ...]
+```
+
+Same UI in its own window (an Edge/Chrome app window, so nothing extra to install). Closing the window stops
+agentflow, after any run in progress finishes. Opening it again while it's running just opens another window.
+
+Windows Desktop shortcut that starts it with no console window (run once in PowerShell):
+
+```powershell
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:USERPROFILE\Desktop\agentflow.lnk")
+$s.TargetPath = "conhost.exe"; $s.Arguments = "--headless python -m agentflow app"; $s.Save()
+```
+
 ## Local models (free, offline)
 
 Runs entirely on your machine with [Ollama](https://ollama.com): no subscription, no key, no internet.
