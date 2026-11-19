@@ -75,6 +75,18 @@ def test_build_cmd_resume_and_mcp():
     assert session_of("plain text") is None and session_of("[1]") is None
 
 
+def test_exe_path_finds_local_bin_off_path(tmp_path, monkeypatch):
+    bin_dir = tmp_path / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    exe = bin_dir / ("myagent.exe" if os.name == "nt" else "myagent")
+    exe.write_text("")
+    exe.chmod(0o755)
+    monkeypatch.setattr(agentflow.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PATH", "")
+    assert agentflow.exe_path("myagent").lower() == str(exe).lower()
+    assert agentflow.exe_path("nope-not-here") is None
+
+
 @pytest.mark.skipif(os.name != "nt", reason="npm .cmd shims are a Windows thing")
 def test_safe_cmd_skips_cmd_exe_for_npm_shims(tmp_path, monkeypatch):
     (tmp_path / "fakecli.cmd").write_text('@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\fake\\cli.js" %*\r\n')

@@ -105,7 +105,12 @@ def agent_env(agent, mcp=None):
 
 
 def exe_path(name):
-    return shutil.which(name) or (name in ALIASES and shutil.which(ALIASES[name])) or None
+    # Claude Code, Cursor and uv-installed tools (aider) live in ~/.local/bin, which often isn't on PATH
+    path = os.pathsep.join([os.environ.get("PATH", ""), str(Path.home() / ".local" / "bin")])
+    for n in (name, ALIASES.get(name)):
+        if n and (found := shutil.which(n, path=path)):
+            return found
+    return None
 
 
 def safe_cmd(cmd):
