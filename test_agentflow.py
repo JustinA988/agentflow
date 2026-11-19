@@ -1,10 +1,12 @@
+import json
+import os
+
 import pytest
 
-import json
-
 import agentflow
-from agentflow import (BUILTIN_AGENTS, MARKER, build_cmd, check_author, clean_log, detect_test_cmd, failed_checks,
-                       feedback_since, final_answer, load_agents, parse_ref, readable, with_model)
+from agentflow import (BUILTIN_AGENTS, MARKER, agent_env, build_cmd, check_author, clean_log, detect_test_cmd,
+                       failed_checks, feedback_since, final_answer, load_agents, parse_ref, readable, safe_cmd,
+                       session_of, with_model)
 
 
 def test_failed_checks_dedupes_and_finds_job():
@@ -57,8 +59,31 @@ def test_with_model():
     with pytest.raises(ValueError, match="needs a model"):
         with_model(ollama, "")
     with pytest.raises(ValueError, match="doesn't take a model"):
-        with_model(BUILTIN_AGENTS["claude"], "qwen3.5:9b")
-    assert with_model(BUILTIN_AGENTS["claude"], None)["cmd"][0] == "claude"
+        with_model({"cmd": ["x", "{prompt}"]}, "qwen3.5:9b")
+    assert "--model" not in build_cmd(with_model(BUILTIN_AGENTS["claude"], None), "hi")
+    assert build_cmd(with_model(BUILTIN_AGENTS["claude"], "sonnet"), "hi")[-2:] == ["--model", "sonnet"]
+
+
+def test_build_cmd_resume_and_mcp():
+    gem = BUILTIN_AGENTS["gemini"]
+    cmd = build_cmd(BUILTIN_AGENTS["claude"], "use {session} {mcp}", session="s1", mcp="/m.json")
+    assert cmd[-4:] == ["--resume", "s1", "--mcp-config", "/m.json"] and "use {session} {mcp}" in cmd
+    assert build_cmd(gem, "hi", session="s1", mcp="/m.json") == ["gemini", "--yolo", "-p", "hi"]  # no resume/mcp flags
+    assert agent_env(gem, "/m.json")["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] == "/m.json"
+    assert "GEMINI_CLI_SYSTEM_SETTINGS_PATH" not in agent_env(gem)
+    assert session_of('{"type": "system", "session_id": "abc"}') == "abc"
+    assert session_of("plain text") is None and session_of("[1]") is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="npm .cmd shims are a Windows thing")
+def test_safe_cmd_skips_cmd_exe_for_npm_shims(tmp_path, monkeypatch):
+    (tmp_path / "fakecli.cmd").write_text('@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\fake\\cli.js" %*\r\n')
+    (tmp_path / "odd.cmd").write_text("@echo off\r\nsomething %*\r\n")
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    cmd = safe_cmd(["fakecli", 'a "quoted" & calc'])
+    assert cmd[1] == str(tmp_path / "node_modules" / "fake" / "cli.js") and cmd[2] == 'a "quoted" & calc'
+    with pytest.raises(RuntimeError, match="can't run safely"):
+        safe_cmd(["odd", "x"])
 
 
 def test_check_author():

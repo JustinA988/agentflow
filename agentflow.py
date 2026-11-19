@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,18 +17,35 @@ import time
 import tomllib
 from pathlib import Path, PureWindowsPath
 
+# cmd runs one turn; optional: model_args (added when a model is picked), resume (continue a chat session),
+# mcp / mcp_env (hand the agent a {"mcpServers": ...} file). Everything here uses the CLI's own sign-in.
 BUILTIN_AGENTS = {
     # stream-json so output arrives live; plain -p prints only at the end
-    "claude": {"cmd": ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"]},
-    "codex": {"cmd": ["codex", "exec", "--full-auto", "{prompt}"]},
+    "claude": {"cmd": ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"],
+               "model_args": ["--model", "{model}"], "resume": ["--resume", "{session}"], "mcp": ["--mcp-config", "{mcp}"]},
+    "codex": {"cmd": ["codex", "exec", "--full-auto", "{prompt}"], "model_args": ["-m", "{model}"]},
     # Claude Code as the harness, any Ollama model as the brain. --bare skips the user's global CLAUDE.md, hooks
     # and plugins, which swamp small models; file tools only. Ollama ignores the key's value; it is not a real key.
     "ollama": {
         "cmd": ["claude", "--bare", "-p", "{prompt}", "--model", "{model}", "--tools", "Read,Edit,Write,Glob,Grep",
                 "--strict-mcp-config", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"],
         "env": {"ANTHROPIC_BASE_URL": "http://localhost:11434", "ANTHROPIC_API_KEY": "ollama"},
+        "resume": ["--resume", "{session}"], "mcp": ["--mcp-config", "{mcp}"],
     },
+    "cursor": {"cmd": ["cursor-agent", "-p", "--force", "--output-format", "stream-json", "{prompt}"],
+               "model_args": ["--model", "{model}"], "resume": ["--resume", "{session}"]},
+    # Gemini and Qwen Code read a "system settings" file that may hold mcpServers; pointing it at ours adds them.
+    "gemini": {"cmd": ["gemini", "--yolo", "-p", "{prompt}"], "model_args": ["-m", "{model}"],
+               "mcp_env": {"GEMINI_CLI_SYSTEM_SETTINGS_PATH": "{mcp}"}},
+    "qwen": {"cmd": ["qwen", "--yolo", "-p", "{prompt}"], "model_args": ["-m", "{model}"],
+             "mcp_env": {"QWEN_CODE_SYSTEM_SETTINGS_PATH": "{mcp}"}},
+    "aider": {"cmd": ["aider", "--yes-always", "--no-auto-commits", "--no-pretty", "--no-check-update", "--message", "{prompt}"],
+              "model_args": ["--model", "{model}"]},
+    "opencode": {"cmd": ["opencode", "run", "{prompt}"], "model_args": ["-m", "{model}"]},
+    "copilot": {"cmd": ["copilot", "--allow-all-tools", "-p", "{prompt}"], "model_args": ["--model", "{model}"],
+                "mcp": ["--additional-mcp-config", "@{mcp}"]},
 }
+ALIASES = {"cursor-agent": "agent"}  # Cursor's installer may name its binary either way
 CONFIG = Path.home() / ".agentflow.toml"
 LOG_LIMIT = 3000  # GitHub PR bodies cap at 65k chars; keep the tail of the log only
 # Only feedback from people with write access reaches the agent; anyone can comment on a public PR.
@@ -53,18 +71,65 @@ def parse_ref(ref):
 
 
 def with_model(agent, model):
-    """Fill the agent's {model} slot. Agents with a slot need a model; agents without one can't take one."""
-    takes_model = any("{model}" in str(x) for x in agent["cmd"])
-    if takes_model and not model:
+    """Set the agent's model. A {model} slot in cmd makes it required; model_args make it optional."""
+    slot = any("{model}" in str(x) for x in agent["cmd"])
+    if slot and not model:
         raise ValueError("this agent needs a model, e.g. --model qwen3.5:9b (see `ollama list`)")
-    if model and not takes_model:
+    if model and not slot and not agent.get("model_args"):
         raise ValueError("this agent doesn't take a model; add \"{model}\" to its cmd in ~/.agentflow.toml")
     return {**agent, "model": model}
 
 
-def build_cmd(agent, prompt):
-    # prompt last, so a "{model}" typed inside an issue is never substituted
-    return [a.replace("{model}", agent.get("model") or "").replace("{prompt}", prompt) for a in agent["cmd"]]
+def build_cmd(agent, prompt, session=None, mcp=None):
+    cmd = list(agent["cmd"])
+    if agent.get("model") and "{model}" not in " ".join(cmd):
+        cmd += agent.get("model_args", [])
+    if session:
+        cmd += agent.get("resume", [])
+    if mcp:
+        cmd += agent.get("mcp", [])
+    fill = {"{model}": agent.get("model") or "", "{session}": session or "", "{mcp}": str(mcp or "")}
+    out = []
+    for a in cmd:
+        for k, v in fill.items():
+            a = a.replace(k, v)
+        out.append(a.replace("{prompt}", prompt))  # prompt last, so "{model}" typed in an issue is never substituted
+    return out
+
+
+def agent_env(agent, mcp=None):
+    env = {**os.environ, **agent.get("env", {})}
+    if mcp:
+        env.update({k: v.replace("{mcp}", str(mcp)) for k, v in agent.get("mcp_env", {}).items()})
+    return env
+
+
+def exe_path(name):
+    return shutil.which(name) or (name in ALIASES and shutil.which(ALIASES[name])) or None
+
+
+def safe_cmd(cmd):
+    """Resolve the agent's program. npm installs CLIs on Windows as .cmd shims, and starting one goes through
+    cmd.exe, which re-parses the prompt (quotes, &, |) as shell syntax: a crafted issue could run commands.
+    So run the shim's node script directly instead."""
+    exe = exe_path(cmd[0]) or cmd[0]
+    if os.name != "nt" or not exe.lower().endswith((".cmd", ".bat")):
+        return [exe, *cmd[1:]]
+    m = re.search(r'"%dp0%\\([^"]+)"\s+%\*',Path(exe).read_text(encoding="utf-8", errors="replace"))
+    if not m:
+        raise RuntimeError(f"{exe} is a batch file agentflow can't run safely; point ~/.agentflow.toml at the real program")
+    here = Path(exe).parent
+    node = here / "node.exe" if (here / "node.exe").is_file() else (shutil.which("node") or "node")
+    return [str(node), str(here / m.group(1)), *cmd[1:]]
+
+
+def session_of(line):
+    """Session id from a stream-json line (Claude Code, Cursor), used to resume the chat next turn."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    return event.get("session_id") if isinstance(event, dict) else None
 
 
 def detect_test_cmd(repo):
@@ -151,9 +216,8 @@ def final_answer(lines):
 
 def run_agent(d, agent, prompt, log):
     """Run the agent in d, streaming readable output to log. Returns its final answer."""
-    env = {**os.environ, **agent.get("env", {})}
     log("status", "Agent working")
-    p = subprocess.Popen(build_cmd(agent, prompt), cwd=d, env=env, stdin=subprocess.DEVNULL,
+    p = subprocess.Popen(safe_cmd(build_cmd(agent, prompt)), cwd=d, env=agent_env(agent), stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **TEXT)
     lines = []
     for line in p.stdout:
