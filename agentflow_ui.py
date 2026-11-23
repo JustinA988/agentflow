@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -26,6 +27,9 @@ CHATS, MCP_FILE, MCP_ACTIVE, WORK = HOME / "chats.json", HOME / "mcp.json", HOME
 SCRATCH = Path.home() / "agentflow-projects"  # where "start from scratch" projects go
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's empty tree: a brand-new repo can diff before its first commit
 MAX_TEAM = 4
+BRAIN = HOME / "brain.json"  # the second brain: notes agents and the user keep across chats
+BRAIN_CHARS = 4000  # newest notes that fit go into each prompt
+REMEMBER = re.compile(r"^[ \t>*-]*REMEMBER:[ \t]*(.+?)[ \t]*$", re.M | re.I)
 ALLOWED_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}"}
 HISTORY_CHARS = 12000  # earlier turns replayed to agents that can't resume a session
 STEPS_KEPT = 400
@@ -161,7 +165,7 @@ def new_chat(kind, target, team, agents, name=""):
         if not target or not p.is_dir():
             raise ValueError(f"folder not found: {target or '(none)'}")
         d = target = str(p.resolve())
-        base = git_head(d)
+        base = snapshot(d)  # the folder as it is now, so the user's own uncommitted work never counts as the agent's
     else:
         raise ValueError("pick a GitHub repo or a folder first")
     now = time.time()
@@ -247,16 +251,132 @@ def send(cid, text, agents, notify=None):
         if m and chat["kind"] != "github":
             raise ValueError("/issue, /fix and /review work in GitHub repo chats")
         past = list(chat["messages"])
-        chat["messages"].append({"role": "user", "text": text})
+        user = {"role": "user", "text": text}
+        chat["messages"].append(user)
         if chat["title"] == "New chat":
             chat["title"] = f"{m.group(1).title()} #{m.group(2)}" if m else text.splitlines()[0][:60]
     if m:
         return start(chat, lambda msg: slash_turn(chat, msg, m, agents), notify)
-    if len(team_of(chat)) > 1:
-        return start(chat, lambda msg: team_turn(chat, msg, text, past, agents))
     role = team_of(chat)[0]["role"]
     prompt = f"(Your role in this project: {role}.)\n\n{text}" if role else text
-    return start(chat, lambda msg: agent_turn(chat, msg, prompt, past, agents))
+
+    def job(msg):
+        user["snapshot"] = snapshot(prepare(chat, msg))
+        if len(team_of(chat)) > 1:
+            team_turn(chat, msg, text, past, agents)
+        else:
+            agent_turn(chat, msg, prompt, past, agents)
+    return start(chat, job)
+
+
+def git_out(d, *args, env=None):
+    r = subprocess.run(["git", *args], cwd=d, env=env, capture_output=True, **TEXT)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def snapshot(d):
+    """A git tree of the whole folder (tracked and new files, minus ignored ones), built in a throwaway index so the
+    user's staging area is never touched. None if the folder isn't in a git repo.
+    shortcut: git gc prunes unreferenced trees after ~2 weeks, so undo works for recent messages only; pin them in refs if needed."""
+    if not git_out(d, "rev-parse", "--git-dir"):
+        return None
+    with tempfile.TemporaryDirectory() as t:
+        env = {**os.environ, "GIT_INDEX_FILE": os.path.join(t, "index")}
+        subprocess.run(["git", "add", "-A"], cwd=d, env=env, capture_output=True, check=True)
+        return git_out(d, "write-tree", env=env)
+
+
+def undo(cid, index):
+    """Put the folder back the way it was before user message `index` (undoing everything since)."""
+    with lock:
+        chat = get(cid)
+        if chat["status"] == "running":
+            raise ValueError("stop the agent before undoing")
+        msgs = chat["messages"]
+        if not isinstance(index, int) or not 0 <= index < len(msgs) or not msgs[index].get("snapshot"):
+            raise ValueError("nothing to undo for that message")
+    top, before, now = git_out(chat["dir"], "rev-parse", "--show-toplevel"), msgs[index]["snapshot"], snapshot(chat["dir"])
+    out = subprocess.run(["git", "diff", "--name-status", "--no-renames", "-z", before, now], cwd=top,
+                         capture_output=True, check=True, **TEXT).stdout.split("\0")
+    restore = []
+    for status, path in zip(out[0::2], out[1::2]):
+        if status == "A":  # created since: remove it
+            (Path(top) / path).unlink(missing_ok=True)
+        else:
+            restore.append(path)
+    if restore:  # --worktree only: files go back, the user's staging area stays as it is
+        run(["git", "restore", f"--source={before}", "--worktree", "--", *restore], top)
+    with lock:
+        for m in msgs[index:]:
+            m["undone"] = True
+        msgs[index]["snapshot"] = None
+        update_changes(chat, {})
+    save_chats()
+    return chat
+
+
+# ---------- second brain ----------
+
+def load_brain():
+    try:
+        notes = json.loads(BRAIN.read_text(encoding="utf-8"))
+        return notes if isinstance(notes, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_brain(notes):
+    BRAIN.parent.mkdir(parents=True, exist_ok=True)
+    BRAIN.write_text(json.dumps(notes, indent=1), encoding="utf-8")
+
+
+def remember(text, project=None, agent="you"):
+    text = " ".join(str(text or "").split())[:500]
+    if not text:
+        raise ValueError("write something to remember")
+    with lock:
+        notes = load_brain()
+        if not any(n["text"] == text and n.get("project") == project for n in notes):
+            notes.append({"id": uuid.uuid4().hex[:8], "text": text, "project": project, "agent": agent, "created": time.time()})
+            save_brain(notes)
+    return {"brain": notes}
+
+
+def edit_brain(b):
+    """add, delete, or share (use a project note in every project). Only the user can share: agents' notes stay
+    with their project, so a malicious repo can't plant instructions that follow you into every chat."""
+    if b.get("action") == "add":
+        return remember(b.get("text"))
+    with lock:
+        notes = load_brain()
+        note = next((n for n in notes if n["id"] == b.get("id")), None)
+        if not note or b.get("action") not in ("delete", "share"):
+            raise ValueError("unknown note or action")
+        if b["action"] == "share":
+            note["project"] = None
+        else:
+            notes.remove(note)
+        save_brain(notes)
+    return {"brain": notes}
+
+
+def with_brain(chat, text):
+    """Hand the agent what the brain knows (notes for every project, plus this one's) and how to add to it."""
+    notes = [n["text"] for n in load_brain() if n.get("project") in (None, chat["target"])]
+    known = "\n".join(f"- {t}" for t in notes)[-BRAIN_CHARS:]
+    head = f"Notes from earlier chats (agentflow memory; the user's message wins if they conflict):\n{known}\n\n" if known else ""
+    return (f"{head}{text}\n\n(If you learn something worth remembering for future work on this project, like a user "
+            "preference, a decision or a key fact, add a line to your reply that starts with \"REMEMBER: \".)")
+
+
+def learn(chat, msg):
+    """Save the agent's REMEMBER: lines to the brain (scoped to this project) and take them out of the reply."""
+    found = [t for t in REMEMBER.findall(msg.get("text") or "") if t]
+    for t in found:
+        remember(t, chat["target"], msg["agent"])
+    if found:
+        msg["text"] = REMEMBER.sub("", msg["text"]).strip()
+        msg["remembered"] = found
 
 
 def step(msg, text):
@@ -285,7 +405,7 @@ def agent_turn(chat, msg, text, past, agents, member=None, track=True):
     sessions = chat.setdefault("sessions", {})  # one per agent, so teammates never resume each other's session
     session = sessions.get(member["name"]) if agent.get("resume") else None
     mcp = active_mcp(load_mcp())
-    cmd = safe_cmd(build_cmd(agent, text if session else with_history(past, text), session, mcp))
+    cmd = safe_cmd(build_cmd(agent, with_brain(chat, text if session else with_history(past, text)), session, mcp))
     p = subprocess.Popen(cmd, cwd=d, env=agent_env(agent, mcp), stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **TEXT)
     with lock:
@@ -299,6 +419,7 @@ def agent_turn(chat, msg, text, past, agents, member=None, track=True):
             step(msg, t)
     code = p.wait()
     msg["text"] = final_answer(lines)
+    learn(chat, msg)
     if msg.get("stopped"):
         msg["status"] = "stopped"
     elif code:
@@ -325,8 +446,37 @@ The user asked: {text}
 The team's agreed plan:
 {plan}
 
-Do only your part of the plan, and don't edit files the plan gives to another agent. When you're done, reply with a
-short summary of what you did."""
+Do only your part of the plan, and don't edit files the plan gives to another agent.
+
+Talk to your teammates through the team chat file {channel} while you work. Read it before you start and again
+before you finish. To tell a teammate something (a name or ID you chose, a question, that a part is done), append
+one line: "{name} -> <teammate or all>: <message>". Only ever append; never rewrite other lines.
+
+When you're done, reply with a short summary of what you did."""
+
+
+def open_channel(chat, text):
+    """Start this message's section of .agentflow/team.md, kept out of git so it never shows up in diffs or PRs.
+    Returns (file, offset of the new section)."""
+    d = Path(chat["dir"])
+    f = d / ".agentflow" / "team.md"
+    f.parent.mkdir(exist_ok=True)
+    if git_dir := git_out(d, "rev-parse", "--git-dir"):
+        exclude = d / git_dir / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        if ".agentflow/" not in (exclude.read_text(encoding="utf-8") if exclude.exists() else ""):
+            with exclude.open("a", encoding="utf-8") as fh:
+                fh.write("\n.agentflow/\n")
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n## {text.splitlines()[0][:80]}\n")
+    return f, f.stat().st_size
+
+
+def read_channel(f, offset):
+    try:
+        return f.read_bytes()[offset:].decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
 
 
 def team_turn(chat, msg, text, past, agents):
@@ -347,16 +497,22 @@ def team_turn(chat, msg, text, past, agents):
         plan = m["text"] or plan
     if not plan:
         raise RuntimeError("the team didn't produce a plan")
+    channel, offset = open_channel(chat, text)
     workers = []
     for member in team:
         wm = new_msg(chat, member["name"], member["role"] or "build")
-        prompt = WORK_PROMPT.format(me=me(member), team=names, text=text, plan=plan)
+        prompt = WORK_PROMPT.format(me=me(member), team=names, text=text, plan=plan,
+                                    channel=".agentflow/team.md", name=member["name"])
         job = lambda wm=wm, member=member, prompt=prompt: agent_turn(chat, wm, prompt, past, agents, member, track=False)
         workers.append(threading.Thread(target=run_part, args=(wm, job), daemon=True))
+    talk = new_msg(chat, "team", "chat")
     for t in workers:
         t.start()
-    for t in workers:
-        t.join()
+    while any(t.is_alive() for t in workers):  # show the team's messages live while they build
+        talk["text"] = read_channel(channel, offset)
+        time.sleep(1)
+    talk["text"] = read_channel(channel, offset) or "The agents didn't message each other this time."
+    talk["status"] = "done"
     update_changes(chat, wm)
 
 
@@ -375,17 +531,15 @@ def slash_turn(chat, msg, m, agents):
 
 
 def update_changes(chat, msg):
-    """Everything changed since the chat began (git diff vs its starting commit, plus new untracked files)."""
-    if not chat["base"]:
+    """Everything changed since the chat began: its starting point vs a snapshot of the folder now (new files included,
+    and the user's own earlier uncommitted work not counted as the agent's)."""
+    now = chat["base"] and snapshot(chat["dir"])
+    if not now:
         return
-    d = chat["dir"]
-    diff = subprocess.run(["git", "diff", chat["base"]], cwd=d, capture_output=True, **TEXT).stdout
-    new = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=d,
-                         capture_output=True, **TEXT).stdout.splitlines()
-    text = (diff[:DIFF_LIMIT] + ("\n... (diff cut short)" if len(diff) > DIFF_LIMIT else "")
-            + "".join(f"\nnew file (untracked): {f}" for f in new)).strip()
+    diff = subprocess.run(["git", "diff", chat["base"], now], cwd=chat["dir"], capture_output=True, **TEXT).stdout
+    text = (diff[:DIFF_LIMIT] + ("\n... (diff cut short)" if len(diff) > DIFF_LIMIT else "")).strip()
     if text != chat["diff"]:
-        msg["files"] = len(re.findall(r"^diff --git ", diff, re.M)) + len(new)
+        msg["files"] = len(re.findall(r"^diff --git ", diff, re.M))
     chat["diff"] = text
 
 
@@ -472,8 +626,8 @@ def state(agents, watching):
     with lock:
         summary = [{k: c[k] for k in ("id", "title", "kind", "target", "agent", "status", "updated", "pr")}
                    for c in sorted(chats.values(), key=lambda c: -c["updated"])]
-    return {"chats": summary, "watching": watching, "mcp": load_mcp(),
-            "agents": [{"name": n, "installed": bool(exe_path(a["cmd"][0])),
+    return {"chats": summary, "watching": watching, "mcp": load_mcp(), "brain": load_brain(),
+            "agents": [{"name": n, "installed": all(exe_path(x) for x in [a["cmd"][0], *a.get("requires", [])]),
                         "needs_model": "{model}" in " ".join(a["cmd"]),
                         "takes_model": "{model}" in " ".join(a["cmd"]) or bool(a.get("model_args")),
                         "mcp": bool(a.get("mcp") or a.get("mcp_env"))} for n, a in agents.items()]}
@@ -534,6 +688,8 @@ class Handler(BaseHTTPRequestHandler):
                                            self.agents, b.get("name", "")),
             "/api/send": lambda: send(b.get("id"), b.get("text"), self.agents),
             "/api/team": lambda: set_team(b.get("id"), b.get("team"), self.agents),
+            "/api/undo": lambda: undo(b.get("id"), b.get("index")),
+            "/api/brain": lambda: edit_brain(b),
             "/api/stop": lambda: stop(b.get("id")),
             "/api/pr": lambda: make_pr(b.get("id")),
             "/api/delete": lambda: delete(b.get("id")),
@@ -729,6 +885,12 @@ main.empty #composerWrap{flex:1}
 .pop .btn{width:100%;justify-content:center;height:36px;border-radius:10px}
 .member{display:flex;gap:6px;padding:0 8px 8px 35px}.member .field{height:30px;font-size:13px;padding:0 10px}
 .pop-note{font-size:12px;color:var(--faint);padding:8px 10px 4px;line-height:1.45}
+.undo-row{display:flex;justify-content:flex-end;margin-top:6px}
+.undo{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--faint);padding:3px 8px;border-radius:8px}
+.undo:hover{color:var(--text);background:var(--elev)}.undo svg{width:14px;height:14px}
+.msg.undone{opacity:.42}
+.mem{margin-top:10px;display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:var(--muted);background:rgba(94,92,230,.12);border:1px solid rgba(94,92,230,.3);border-radius:12px;padding:7px 12px}
+.mem svg{width:15px;height:15px;color:#a5a4ff;margin-top:2px}
 .lbl{color:var(--muted);background:var(--elev);border:1px solid var(--line);border-radius:6px;padding:0 7px;font-size:11.5px}
 
 #drawer{position:fixed;top:0;right:0;bottom:0;width:min(760px,100%);background:var(--panel);border-left:1px solid var(--line2);transform:translateX(100%);transition:transform .28s cubic-bezier(.2,.8,.2,1);z-index:15;display:flex;flex-direction:column}
@@ -745,7 +907,7 @@ dialog[open]{display:flex;flex-direction:column;animation:pop .18s ease-out}
 dialog::backdrop{background:rgba(0,0,0,.6);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
 .dlg-head{display:flex;align-items:center;gap:12px;padding:16px 14px 6px 22px}
 .dlg-head h2{font-size:18px;margin:0;font-weight:600;letter-spacing:-.01em}
-.dlg-head .seg{margin:0 auto;width:250px}
+.dlg-head .seg{margin:0 auto;width:340px}
 .dlg-body{padding:10px 22px 22px;overflow-y:auto}
 .card{background:var(--elev);border-radius:14px;border:1px solid var(--line);overflow:hidden}
 .card-row{display:flex;align-items:center;gap:12px;padding:12px 14px;border-top:1px solid var(--line);min-width:0}
@@ -821,7 +983,7 @@ dialog::backdrop{background:rgba(0,0,0,.6);-webkit-backdrop-filter:blur(8px);bac
   <div id="diff"></div>
 </aside>
 <dialog id="settings" aria-label="Settings">
-  <div class="dlg-head"><h2>Settings</h2><div class="seg" id="setSeg"><button data-tab="agents">Agents</button><button data-tab="mcp">MCP servers</button></div>
+  <div class="dlg-head"><h2>Settings</h2><div class="seg" id="setSeg"><button data-tab="agents">Agents</button><button data-tab="mcp">MCP servers</button><button data-tab="brain">Memory</button></div>
     <button class="icon-btn" id="closeSettings" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
   <div class="dlg-body" id="setBody"></div>
 </dialog>
@@ -841,6 +1003,9 @@ const I = {
   pr:'<svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M6 8.5v7M18 15.5V9a3 3 0 0 0-3-3h-4m2-2-2 2 2 2"/></svg>',
   plus:'<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
   check:'<svg viewBox="0 0 24 24" style="color:var(--accent)"><path d="m5 12 5 5 9-10"/></svg>',
+  undo:'<svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></svg>',
+  brain:'<svg viewBox="0 0 24 24"><path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 6 1V5a2 2 0 0 0-3-1z"/><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-6 1"/></svg>',
+  chat:'<svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>',
   logo:'<span class="logo"><svg viewBox="0 0 24 24"><path d="M6 17l6-10 6 10"/></svg></span>'
 };
 const ABOUT = {claude:'Claude Code · your Claude plan', codex:'OpenAI Codex · your ChatGPT plan', ollama:'Local models through Ollama · free, offline',
@@ -933,9 +1098,15 @@ function renderComposer() {
 }
 
 function msgHtml(m, i) {
-  if (m.role === 'user') return `<div class="msg user"><div class="bubble">${esc(m.text)}</div></div>`;
+  if (m.role === 'user') {
+    let u = `<div class="msg user${m.undone ? ' undone' : ''}"><div class="bubble">${esc(m.text)}</div></div>`;
+    if (m.undone && !m.snapshot) u += '<div class="undo-row note" style="margin:-22px 0 30px">Changes from here were undone</div>';
+    else if (m.snapshot && !m.undone && cur.status !== 'running' && cur.messages.slice(i + 1).some(x => x.files))
+      u += `<div class="undo-row" style="margin:-22px 0 30px"><button class="undo" data-undo="${i}" title="Put every file back the way it was before this message">${I.undo}Undo changes from here</button></div>`;
+    return u;
+  }
   const steps = m.steps || [], tools = steps.filter(s => s.startsWith('→')).length;
-  let h = `<div class="msg"><div class="who">${m.agent === 'agentflow' ? I.logo : I.spark}${esc(m.agent)}${m.label ? `<span class="lbl">${esc(m.label)}</span>` : ''}</div>`;
+  let h = `<div class="msg${m.undone ? ' undone' : ''}"><div class="who">${m.agent === 'agentflow' ? I.logo : m.agent === 'team' ? I.chat : I.spark}${esc(m.agent)}${m.label ? `<span class="lbl">${esc(m.label)}</span>` : ''}</div>`;
   if (m.status === 'running') {
     h += `<div class="working">${m.stopped ? 'Stopping…' : steps.length ? 'Working…' : 'Thinking…'}</div>`;
     if (steps.length) h += `<div class="log live">${esc(steps.slice(-16).join('\n'))}</div>`;
@@ -945,6 +1116,7 @@ function msgHtml(m, i) {
   else if (!m.error && m.status !== 'stopped') h += '<div class="note">No reply.</div>';
   if (m.status === 'stopped') h += '<div class="note">Stopped.</div>';
   if (m.error) h += `<div class="error">${esc(m.error)}</div>`;
+  if (m.remembered) h += `<div class="mem">${I.brain}<span>Remembered: ${m.remembered.map(esc).join(' · ')}</span></div>`;
   if (steps.length) h += `<details class="steps" data-i="${i}"${openSteps.has(cur.id + i) ? ' open' : ''}><summary>${I.chev}${tools ? `Used ${tools} tool${tools > 1 ? 's' : ''}` : 'Show log'}</summary><div class="log">${esc(steps.join('\n'))}</div></details>`;
   if (m.files) h += `<div><button class="pill" data-diff>${I.file}${m.files} file${m.files > 1 ? 's' : ''} changed · View</button></div>`;
   return h + '</div>';
@@ -1139,11 +1311,10 @@ $('#newBtn').onclick = newChat;
 $('#menuBtn').onclick = () => $('#side').classList.toggle('open');
 $('#prBtn').onclick = async () => { try { cur = await api('/api/pr', {id: cur.id}); stick = true; render(); poll(); } catch (e) { toast(e.message); } };
 function openDiff() {
-  const files = (cur.diff.match(/^diff --git /gm) || []).length + (cur.diff.match(/^new file \(untracked\)/gm) || []).length;
+  const files = (cur.diff.match(/^diff --git /gm) || []).length;
   $('#diffTitle').textContent = `Changes in this chat · ${files} file${files === 1 ? '' : 's'}`;
   $('#diff').innerHTML = cur.diff.split('\n').map(l => {
     if (l.startsWith('diff --git')) return `<div class="h">${esc(l.replace(/^diff --git a\/(.*?) b\/.*$/, '$1'))}</div>`;
-    if (l.startsWith('new file (untracked)')) return `<div class="h">${esc(l.slice(22))} <span style="color:var(--green);font-weight:400">new</span></div>`;
     const c = /^(\+\+\+|---|@@|index |new file mode|deleted file mode|similarity|rename )/.test(l) ? 'm' : l[0] === '+' ? 'a' : l[0] === '-' ? 'd' : '';
     return `<div class="${c}">${esc(l) || ' '}</div>`;
   }).join('');
@@ -1151,7 +1322,12 @@ function openDiff() {
 }
 $('#changesBtn').onclick = openDiff;
 $('#closeDiff').onclick = () => $('#drawer').classList.remove('open');
-$('#msgs').addEventListener('click', e => { if (e.target.closest('[data-diff]')) openDiff(); });
+$('#msgs').addEventListener('click', async e => {
+  if (e.target.closest('[data-diff]')) return openDiff();
+  const u = e.target.closest('[data-undo]');
+  if (!u || !confirm('Put every file back the way it was before this message?\n\nChanges from later messages are undone too.')) return;
+  try { cur = await api('/api/undo', {id: cur.id, index: +u.dataset.undo}); sig = ''; render(); toast('Files put back.'); } catch (err) { toast(err.message); }
+});
 $('#msgs').addEventListener('toggle', e => { const d = e.target; if (d.dataset && d.dataset.i !== undefined) d.open ? openSteps.add(cur.id + d.dataset.i) : openSteps.delete(cur.id + d.dataset.i); }, true);
 
 // ---------- settings ----------
@@ -1163,6 +1339,16 @@ function fillSettings() {
       <div class="sub">${a.installed ? esc(ABOUT[a.name] || 'Custom agent from ~/.agentflow.toml') : 'Install: <code>' + esc(INSTALL[a.name] || 'see the tool\'s docs') + '</code>'}</div></div>
       <span class="status${a.installed ? '' : ' no'}">${a.installed ? 'Ready' : 'Not installed'}</span></div>`).join('') + '</div>' +
       '<p class="muted">Agents use their own sign-in (your subscription), so there are no API keys here. After installing one, run it once in a terminal to sign in.</p>';
+    return;
+  }
+  if (setTab === 'brain') {
+    const notes = (S.brain || []).slice().reverse();
+    const where = n => !n.project ? 'All projects' : /^[\w.-]+\/[\w.-]+$/.test(n.project) ? n.project : base(n.project);
+    body.innerHTML = `<p class="muted" style="margin:4px 2px 12px">Your second brain. Every agent reads these notes with each message, and saves new ones when it learns something. Notes an agent saves stay with that project.</p>
+      <div class="card">${notes.length ? notes.map(n => `<div class="card-row"><div class="grow"><div class="name" style="font-weight:400">${esc(n.text)}</div>
+        <div class="sub">${esc(where(n))} · ${esc(n.agent)}</div></div>${n.project ? `<button class="btn" data-share="${n.id}" title="Give this note to agents in every project">Use everywhere</button>` : ''}<button class="icon-btn" data-forget="${n.id}" aria-label="Forget this note">${I.trash}</button></div>`).join('')
+        : '<div class="empty-card">Nothing yet. Agents add notes as they learn, or add your own below.</div>'}</div>
+      <div class="drop" style="display:flex;gap:8px;align-items:center"><input class="field" id="brainIn" placeholder="Something every agent should always know…" aria-label="New note"><button class="btn primary" id="brainAdd" style="flex:none">Add</button></div>`;
     return;
   }
   const names = Object.keys(S.mcp), shared = S.agents.filter(a => a.mcp).map(a => a.name).join(', ');
@@ -1178,6 +1364,8 @@ function fillSettings() {
       <button class="icon-btn" data-remove="${esc(n)}" aria-label="Remove ${esc(n)}">${I.trash}</button></div>`; }).join('')
     : '<div class="empty-card">No MCP servers yet. Add one below.</div>') + '</div>';
 }
+async function brain(body) { try { S.brain = (await api('/api/brain', body)).brain; fillSettings(); } catch (e) { toast(e.message); } }
+$('#setBody').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'brainIn') brain({action: 'add', text: e.target.value}); });
 async function mcp(body) { try { S.mcp = (await api('/api/mcp', body)).mcp; fillSettings(); return true; } catch (e) { toast(e.message); } }
 $('#settingsBtn').onclick = () => { fillSettings(); $('#settings').showModal(); };
 $('#closeSettings').onclick = () => $('#settings').close();
@@ -1187,6 +1375,11 @@ $('#setBody').addEventListener('change', e => { if (e.target.dataset.toggle) mcp
 $('#setBody').addEventListener('click', async e => {
   const r = e.target.closest('[data-remove]');
   if (r && confirm(`Remove the MCP server "${r.dataset.remove}"?`)) mcp({action: 'delete', name: r.dataset.remove});
+  const f = e.target.closest('[data-forget]');
+  if (f) brain({action: 'delete', id: f.dataset.forget});
+  const sh = e.target.closest('[data-share]');
+  if (sh) brain({action: 'share', id: sh.dataset.share});
+  if (e.target.id === 'brainAdd') brain({action: 'add', text: $('#brainIn').value});
   if (e.target.id === 'mcpAdd') { const t = $('#mcpText'); if (t.value.trim() && await mcp({action: 'add', text: t.value})) { t.value = ''; toast('MCP server added.'); } }
 });
 $('#setBody').addEventListener('dragover', e => { const d = e.target.closest('#drop'); if (d) { e.preventDefault(); d.classList.add('over'); } });

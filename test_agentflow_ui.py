@@ -17,14 +17,14 @@ FAKE = {"cmd": [sys.executable, "-c", "print('hello from fake'); open('new.txt',
 TEAMY = {"cmd": [sys.executable, "-c", """import os, sys
 p = sys.argv[-1]
 if 'agreed plan' in p:
-    open(f'part-{os.getpid()}.txt', 'w').write('x'); print('built')
+    open(f'part-{os.getpid()}.txt', 'w').write('x'); open('.agentflow/team.md', 'a').write('me -> all: hi\\n'); print('built')
 else:
     print('FINAL PLAN' if 'drafted this plan' in p else 'PLAN: split it')""", "{prompt}"]}
 
 
 @pytest.fixture(autouse=True)
 def home(tmp_path, monkeypatch):
-    for name, file in [("CHATS", "chats.json"), ("MCP_FILE", "mcp.json"), ("MCP_ACTIVE", "mcp-active.json"), ("WORK", "work"), ("SCRATCH", "projects")]:
+    for name, file in [("CHATS", "chats.json"), ("MCP_FILE", "mcp.json"), ("MCP_ACTIVE", "mcp-active.json"), ("WORK", "work"), ("SCRATCH", "projects"), ("BRAIN", "brain.json")]:
         monkeypatch.setattr(ui, name, tmp_path / "home" / file)
     ui.chats.clear()
     ui.Handler.agents = {"claude": {"cmd": ["claude", "-p", "{prompt}"], "model_args": ["--model", "{model}"]}, "fake": FAKE}
@@ -144,5 +144,52 @@ def test_team_plans_then_builds_at_once_in_a_new_project(server):
     req(server, "POST", "/api/send", {"id": chat["id"], "text": "build it"})
     msgs = wait_idle(server, chat["id"])["messages"][1:]
     assert [(m["agent"], m["label"], m["text"]) for m in msgs[:2]] == [("a", "plan", "PLAN: split it"), ("b", "plan review", "FINAL PLAN")]
-    assert sorted((m["agent"], m["label"], m["text"]) for m in msgs[2:]) == [("a", "design", "built"), ("b", "coding", "built")]
-    assert all(m["status"] == "done" for m in msgs) and msgs[-1]["files"] == 2  # both built, in parallel, in one folder
+    assert sorted((m["agent"], m["label"], m["text"]) for m in msgs[2:4]) == [("a", "design", "built"), ("b", "coding", "built")]
+    talk = msgs[4]
+    assert (talk["agent"], talk["label"]) == ("team", "chat") and talk["text"].count("me -> all: hi") == 2  # agents messaged
+    assert all(m["status"] == "done" for m in msgs) and msgs[3]["files"] == 2  # both built in one folder; chat file not counted
+    assert ".agentflow/" in (folder / ".git" / "info" / "exclude").read_text()
+
+
+# Edits a tracked file and creates a new one, and leaves a note for the second brain.
+EDITOR = {"cmd": [sys.executable, "-c", """open('a.txt', 'w').write('changed'); open('new.txt', 'w').write('x')
+print('edited it')
+print('REMEMBER: the user likes small files')""", "{prompt}"]}
+
+
+def test_undo_restores_folder_and_agents_feed_the_brain(server, tmp_path):
+    ui.Handler.agents["editor"] = EDITOR
+    repo = git_repo(tmp_path / "proj")
+    (repo / "a.txt").write_text("original")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)  # staged by the user: undo must leave this alone
+    _, chat = req(server, "POST", "/api/chats", {"kind": "local", "target": str(repo), "agent": "editor"})
+    req(server, "POST", "/api/send", {"id": chat["id"], "text": "change things"})
+    chat = wait_idle(server, chat["id"])
+    reply = chat["messages"][1]
+    assert reply["text"] == "edited it" and reply["remembered"] == ["the user likes small files"]
+    _, state = req(server, "GET", "/api/state")
+    assert [(n["text"], n["project"], n["agent"]) for n in state["brain"]] == [("the user likes small files", str(repo), "editor")]
+    assert (repo / "a.txt").read_text() == "changed" and chat["messages"][0]["snapshot"]
+
+    status, chat = req(server, "POST", "/api/undo", {"id": chat["id"], "index": 0})
+    assert status == 200 and (repo / "a.txt").read_text() == "original" and not (repo / "new.txt").exists()
+    assert all(m["undone"] for m in chat["messages"]) and chat["diff"] == ""
+    staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=repo, capture_output=True, text=True).stdout
+    assert staged.split() == ["a.txt"]  # the user's staging area is untouched
+    assert req(server, "POST", "/api/undo", {"id": chat["id"], "index": 0})[0] == 400  # already undone
+
+
+def test_brain_notes_reach_prompts_per_project(server):
+    req(server, "POST", "/api/brain", {"action": "add", "text": "  always use   tabs "})
+    ui.remember("this repo uses pytest", "octo/cat", "claude")
+    ui.remember("other repo fact", "octo/dog", "claude")
+    prompt = ui.with_brain({"target": "octo/cat"}, "fix it")
+    assert "- always use tabs\n- this repo uses pytest" in prompt and "other repo fact" not in prompt and "REMEMBER: " in prompt
+    note = next(n for n in ui.load_brain() if n["text"] == "always use tabs")
+    assert note["project"] is None
+    _, body = req(server, "POST", "/api/brain", {"action": "delete", "id": note["id"]})
+    assert [n["text"] for n in body["brain"]] == ["this repo uses pytest", "other repo fact"]
+    req(server, "POST", "/api/brain", {"action": "share", "id": body["brain"][1]["id"]})  # user makes it global
+    assert "other repo fact" in ui.with_brain({"target": "octo/cat"}, "x")
+    assert req(server, "POST", "/api/brain", {"action": "share", "id": "nope"})[0] == 400
+    assert req(server, "POST", "/api/brain", {"action": "add", "text": " "})[0] == 400

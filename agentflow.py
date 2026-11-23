@@ -30,6 +30,7 @@ BUILTIN_AGENTS = {
         "cmd": ["claude", "--bare", "-p", "{prompt}", "--model", "{model}", "--tools", "Read,Edit,Write,Glob,Grep",
                 "--strict-mcp-config", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"],
         "env": {"ANTHROPIC_BASE_URL": "http://localhost:11434", "ANTHROPIC_API_KEY": "ollama"},
+        "requires": ["ollama"],  # without Ollama itself, claude just retries a dead localhost until it gives up
         "resume": ["--resume", "{session}"], "mcp": ["--mcp-config", "{mcp}"],
     },
     "cursor": {"cmd": ["cursor-agent", "-p", "--force", "--output-format", "stream-json", "{prompt}"],

@@ -21,8 +21,14 @@ A dark chat window, like Claude or ChatGPT:
 - **Pick an agent** and, optionally, a model. Switch any time, even mid-chat.
 - **Or pick a team** (up to 4 agents), each with an optional role like "design" or "coding". For each message the
   team plans first: the lead drafts a plan that gives every agent its tasks and its own files, and each teammate
-  reviews and revises it. Then they all build their parts at the same time in the shared project folder. They
-  coordinate only through the plan, so keep the work splittable by file.
+  reviews and revises it. Then they all build their parts at the same time in the shared project folder, talking
+  through a team chat file (`.agentflow/team.md`, kept out of git) that you see live in the chat. Keep the work
+  splittable by file.
+- **Undo** under any of your messages puts every file back the way it was before it (later messages' changes too).
+  It works in any git folder, and it never touches your staging area.
+- **Second brain** (Settings → Memory): agents get these notes with every message, and save new ones by writing a
+  line that starts with `REMEMBER:`. Agent notes stay with their project; click **Use everywhere** to share one
+  with every project, or add your own notes there.
 - **Chat.** The agent reads and edits code and replies; follow-up messages keep the conversation's context.
   You see its steps live, every change as a color-coded diff, and a Stop button.
 - **Create PR** (GitHub chats): commits, runs the tests, pushes and opens the PR (a draft if tests fail).
