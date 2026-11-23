@@ -457,7 +457,7 @@ When you're done, reply with a short summary of what you did."""
 
 
 def outbox(name):
-    return f".agentflow/team/{re.sub(r'[^\w.-]', '_', name)}.md"
+    return ".agentflow/team/" + re.sub(r"[^\w.-]", "_", name) + ".md"
 
 
 def open_channel(chat, team):
