@@ -17,7 +17,7 @@ FAKE = {"cmd": [sys.executable, "-c", "print('hello from fake'); open('new.txt',
 TEAMY = {"cmd": [sys.executable, "-c", """import os, sys
 p = sys.argv[-1]
 if 'agreed plan' in p:
-    open(f'part-{os.getpid()}.txt', 'w').write('x'); open('.agentflow/team.md', 'a').write('me -> all: hi\\n'); print('built')
+    open(f'part-{os.getpid()}.txt', 'w').write('x'); open(__import__('re').search(r'Your outbox is (\\S+?):', p).group(1), 'a').write('me -> all: hi\\n'); print('built')
 else:
     print('FINAL PLAN' if 'drafted this plan' in p else 'PLAN: split it')""", "{prompt}"]}
 

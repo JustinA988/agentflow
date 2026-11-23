@@ -448,35 +448,49 @@ The team's agreed plan:
 
 Do only your part of the plan, and don't edit files the plan gives to another agent.
 
-Talk to your teammates through the team chat file {channel} while you work. Read it before you start and again
-before you finish. To tell a teammate something (a name or ID you chose, a question, that a part is done), append
-one line: "{name} -> <teammate or all>: <message>". Only ever append; never rewrite other lines.
+Talk to your teammates through the team chat folder .agentflow/team/ while you work. Your outbox is {outbox}:
+to tell a teammate something (a name or ID you chose, a question, that a part is done), append one line there:
+"{name} -> <teammate or all>: <message>". Only write to your own outbox. Read your teammates' files in that folder
+before you start and again before you finish.
 
 When you're done, reply with a short summary of what you did."""
 
 
-def open_channel(chat, text):
-    """Start this message's section of .agentflow/team.md, kept out of git so it never shows up in diffs or PRs.
-    Returns (file, offset of the new section)."""
+def outbox(name):
+    return f".agentflow/team/{re.sub(r'[^\w.-]', '_', name)}.md"
+
+
+def open_channel(chat, team):
+    """Each agent gets its own outbox file in .agentflow/team/ (kept out of git, so never in diffs or PRs): two agents
+    writing one shared file at once can overwrite each other's lines. Returns (folder, current size of each file)."""
     d = Path(chat["dir"])
-    f = d / ".agentflow" / "team.md"
-    f.parent.mkdir(exist_ok=True)
+    room = d / ".agentflow" / "team"
+    room.mkdir(parents=True, exist_ok=True)
     if git_dir := git_out(d, "rev-parse", "--git-dir"):
         exclude = d / git_dir / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
         if ".agentflow/" not in (exclude.read_text(encoding="utf-8") if exclude.exists() else ""):
             with exclude.open("a", encoding="utf-8") as fh:
                 fh.write("\n.agentflow/\n")
-    with f.open("a", encoding="utf-8") as fh:
-        fh.write(f"\n## {text.splitlines()[0][:80]}\n")
-    return f, f.stat().st_size
+    for m in team:
+        (d / outbox(m["name"])).touch()
+    return room, {f.name: f.stat().st_size for f in room.glob("*.md")}
 
 
-def read_channel(f, offset):
-    try:
-        return f.read_bytes()[offset:].decode("utf-8", "replace").strip()
-    except OSError:
-        return ""
+def read_channel(room, offsets, log, final=False):
+    """Add each outbox's new lines to log, in the order they're seen, so the merged chat reads like a conversation.
+    Lines still being written are left for the next read, unless this is the final one."""
+    for f in sorted(room.glob("*.md")):
+        try:
+            data = f.read_bytes()
+        except OSError:
+            continue
+        start = offsets.get(f.name, 0)
+        end = len(data) if final else data.rfind(b"\n", start) + 1
+        if end > start:
+            log += [line for line in data[start:end].decode("utf-8", "replace").splitlines() if line.strip()]
+            offsets[f.name] = end
+    return "\n".join(log)
 
 
 def team_turn(chat, msg, text, past, agents):
@@ -497,21 +511,22 @@ def team_turn(chat, msg, text, past, agents):
         plan = m["text"] or plan
     if not plan:
         raise RuntimeError("the team didn't produce a plan")
-    channel, offset = open_channel(chat, text)
+    room, offsets = open_channel(chat, team)
+    log = []
     workers = []
     for member in team:
         wm = new_msg(chat, member["name"], member["role"] or "build")
         prompt = WORK_PROMPT.format(me=me(member), team=names, text=text, plan=plan,
-                                    channel=".agentflow/team.md", name=member["name"])
+                                    outbox=outbox(member["name"]), name=member["name"])
         job = lambda wm=wm, member=member, prompt=prompt: agent_turn(chat, wm, prompt, past, agents, member, track=False)
         workers.append(threading.Thread(target=run_part, args=(wm, job), daemon=True))
     talk = new_msg(chat, "team", "chat")
     for t in workers:
         t.start()
     while any(t.is_alive() for t in workers):  # show the team's messages live while they build
-        talk["text"] = read_channel(channel, offset)
+        talk["text"] = read_channel(room, offsets, log)
         time.sleep(1)
-    talk["text"] = read_channel(channel, offset) or "The agents didn't message each other this time."
+    talk["text"] = read_channel(room, offsets, log, final=True) or "The agents didn't message each other this time."
     talk["status"] = "done"
     update_changes(chat, wm)
 

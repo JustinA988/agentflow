@@ -22,7 +22,7 @@ A dark chat window, like Claude or ChatGPT:
 - **Or pick a team** (up to 4 agents), each with an optional role like "design" or "coding". For each message the
   team plans first: the lead drafts a plan that gives every agent its tasks and its own files, and each teammate
   reviews and revises it. Then they all build their parts at the same time in the shared project folder, talking
-  through a team chat file (`.agentflow/team.md`, kept out of git) that you see live in the chat. Keep the work
+  through a team chat (one outbox file per agent in `.agentflow/team/`, kept out of git) that you see live. Keep the work
   splittable by file.
 - **Undo** under any of your messages puts every file back the way it was before it (later messages' changes too).
   It works in any git folder, and it never touches your staging area.
